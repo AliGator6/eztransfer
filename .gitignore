@@ -1,6 +1,8 @@
 node_modules/
 build/
 dist/
+android/
+EzTransfer.apk
 coverage/
 .DS_Store
 *.log

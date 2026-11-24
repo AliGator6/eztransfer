@@ -78,7 +78,16 @@ function toPublicPeer(peer: PeerRecord): PublicPeer {
 async function startServer() {
   const app = express();
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request, socket, head) => {
+    const reqUrl = new URL(request.url || '/', 'http://localhost');
+    if (reqUrl.pathname === '/ws') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    }
+  });
 
   const peers = new Map<string, PeerRecord>();
   const codeToPeerId = new Map<string, string>();
@@ -261,14 +270,16 @@ async function startServer() {
         'package.json',
         'tsconfig.json',
         'vite.config.ts',
+        'capacitor.config.ts',
         'server.ts',
         'index.html',
         'metadata.json',
         '.env.example',
         '.gitignore',
         'README.md',
+        '.github/workflows/build-apk.yml',
       ];
-      const allowDirs = ['src', 'public'];
+      const allowDirs = ['src', 'public', 'scripts'];
       const collected: Array<{ relPath: string; b64: string }> = [];
 
       for (const file of allowFiles) {
@@ -287,6 +298,7 @@ async function startServer() {
         for (const entry of fs.readdirSync(dirFull, { withFileTypes: true })) {
           if (entry.name.startsWith('.')) continue;
           const nextRel = `${dirRel}/${entry.name}`;
+          if (nextRel === 'public/assets/aistudio') continue;
           const nextFull = path.join(rootDir, nextRel);
           if (entry.isDirectory()) {
             walkDir(nextRel);
@@ -348,7 +360,7 @@ async function startServer() {
         '',
         'echo "[4/4] Memasang dependensi npm (100% open-source/gratis)..."',
         'cd "$TARGET_DIR"',
-        'npm install',
+        'npm install --legacy-peer-deps',
         '',
         'WIFI_IP="$(ip -4 addr show wlan0 2>/dev/null | awk \'/inet /{print $2}\' | cut -d/ -f1 | head -n1)"',
         'echo ""',
@@ -365,6 +377,8 @@ async function startServer() {
       const scriptText = lines.join('\n');
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="eztransfer-setup.txt"');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
       res.setHeader('Content-Length', String(Buffer.byteLength(scriptText, 'utf8')));
       res.send(scriptText);
     } catch {
@@ -379,14 +393,16 @@ async function startServer() {
         'package.json',
         'tsconfig.json',
         'vite.config.ts',
+        'capacitor.config.ts',
         'server.ts',
         'index.html',
         'metadata.json',
         '.env.example',
         '.gitignore',
         'README.md',
+        '.github/workflows/build-apk.yml',
       ];
-      const allowDirs = ['src', 'public'];
+      const allowDirs = ['src', 'public', 'scripts'];
 
       const collected: Array<{ relPath: string; content: Buffer; mtime: number }> = [];
 
@@ -408,6 +424,7 @@ async function startServer() {
         for (const entry of fs.readdirSync(dirFull, { withFileTypes: true })) {
           if (entry.name.startsWith('.')) continue;
           const nextRel = `${dirRel}/${entry.name}`;
+          if (nextRel === 'public/assets/aistudio') continue;
           const nextFull = path.join(rootDir, nextRel);
           if (entry.isDirectory()) {
             walkDir(nextRel);
@@ -484,7 +501,11 @@ async function startServer() {
     });
   } else {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : undefined,
+        ws: { server, path: '/__vite_hmr' },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

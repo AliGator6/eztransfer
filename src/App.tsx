@@ -23,6 +23,7 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { TransferMonitor } from './components/TransferMonitor';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useWifiTransfer } from './hooks/useWifiTransfer';
+import { isNativeAndroid } from './native/androidPlugins';
 import type { PeerInfo } from './types/transfer';
 import { formatBytes, formatDuration, formatSpeed, getDeviceLabel } from './utils/format';
 import { createBatchItem } from './utils/mediaPreview';
@@ -30,6 +31,7 @@ import { createBatchItem } from './utils/mediaPreview';
 type ActiveTab = 'transfer' | 'riwayat' | 'panduan';
 
 export default function App() {
+  const nativeAndroid = isNativeAndroid();
   const isOnline = useOnlineStatus();
   const {
     wsConnected,
@@ -42,6 +44,9 @@ export default function App() {
     incomingFilesProgress,
     progress,
     history,
+    nativeServerInfo,
+    customServerHost,
+    setCustomServerHost,
     lookupPairCode,
     setPairedPeer,
     addFilesToQueue,
@@ -60,7 +65,15 @@ export default function App() {
   const [codeInput, setCodeInput] = useState('');
   const [showQrPanel, setShowQrPanel] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedServerUrl, setCopiedServerUrl] = useState(false);
+  const [showHostSwitch, setShowHostSwitch] = useState(Boolean(customServerHost));
+  const [hostInput, setHostInput] = useState(customServerHost);
   const [copiedTermuxCmd, setCopiedTermuxCmd] = useState(false);
+  const [downloadingTxt, setDownloadingTxt] = useState(false);
+  const [copyingTxt, setCopyingTxt] = useState(false);
+  const [txtFeedback, setTxtFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(
+    null
+  );
 
   const [isDragging, setIsDragging] = useState(false);
   const [extractingFiles, setExtractingFiles] = useState(false);
@@ -117,14 +130,42 @@ export default function App() {
     void handleFilesSelected(e.dataTransfer.files);
   };
 
+  const copyPlainText = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return copied;
+    } catch {
+      return false;
+    }
+  };
+
   const handleCopyCode = async () => {
     if (!selfPeer) return;
-    try {
-      await navigator.clipboard.writeText(selfPeer.pairCode);
+    const ok = await copyPlainText(selfPeer.pairCode);
+    if (ok) {
       setCopiedCode(true);
       window.setTimeout(() => setCopiedCode(false), 1800);
-    } catch {
-      // ignore clipboard restrictions
+    }
+  };
+
+  const handleCopyServerUrl = async () => {
+    if (!nativeServerInfo?.url) return;
+    const ok = await copyPlainText(nativeServerInfo.url);
+    if (ok) {
+      setCopiedServerUrl(true);
+      window.setTimeout(() => setCopiedServerUrl(false), 1800);
     }
   };
 
@@ -133,9 +174,95 @@ export default function App() {
     lookupPairCode(codeInput);
   };
 
-  const pairShareUrl = selfPeer
-    ? `${window.location.origin}/?pair=${selfPeer.pairCode}`
-    : window.location.origin;
+  const qrBaseUrl =
+    nativeAndroid && nativeServerInfo?.url ? nativeServerInfo.url : window.location.origin;
+
+  const pairShareUrl = selfPeer ? `${qrBaseUrl}/?pair=${selfPeer.pairCode}` : qrBaseUrl;
+
+  const fetchSetupScriptText = async (): Promise<string> => {
+    const res = await fetch(`/api/download-txt?t=${Date.now()}`, {
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      throw new Error(`Server mengembalikan status ${res.status}`);
+    }
+    const text = await res.text();
+    if (!text.startsWith('#!/usr/bin/env bash')) {
+      throw new Error('Respons server bukan script setup yang valid.');
+    }
+    return text;
+  };
+
+  const handleDownloadTxt = async () => {
+    setDownloadingTxt(true);
+    setTxtFeedback(null);
+    try {
+      const scriptText = await fetchSetupScriptText();
+      const blob = new Blob([scriptText], { type: 'text/plain;charset=utf-8' });
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = 'eztransfer-setup.txt';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 8000);
+      setTxtFeedback({
+        type: 'success',
+        text: 'File eztransfer-setup.txt berhasil disiapkan. Cek folder Download di perangkat Anda.',
+      });
+    } catch (err) {
+      setTxtFeedback({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? `Gagal mengunduh: ${err.message}. Gunakan tombol "Salin Isi File (.txt)" di samping.`
+            : 'Gagal mengunduh file. Gunakan tombol "Salin Isi File (.txt)" di samping.',
+      });
+    } finally {
+      setDownloadingTxt(false);
+    }
+  };
+
+  const handleCopyTxtContent = async () => {
+    setCopyingTxt(true);
+    setTxtFeedback(null);
+    try {
+      const scriptText = await fetchSetupScriptText();
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(scriptText);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = scriptText;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        if (!copied) {
+          throw new Error('Browser memblokir akses clipboard.');
+        }
+      }
+      setTxtFeedback({
+        type: 'success',
+        text: 'Isi script (.txt) tersalin! Di Termux ketik: cat > ~/eztransfer-setup.txt lalu Tempel, Enter, tekan Ctrl+D, lalu jalankan: bash ~/eztransfer-setup.txt',
+      });
+    } catch (err) {
+      setTxtFeedback({
+        type: 'error',
+        text:
+          err instanceof Error
+            ? `Gagal menyalin: ${err.message}`
+            : 'Gagal menyalin isi file setup.',
+      });
+    } finally {
+      setCopyingTxt(false);
+    }
+  };
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
@@ -189,9 +316,11 @@ export default function App() {
             </button>
           </nav>
 
-          <div className="flex items-center shrink-0">
-            <PWAInstallButton />
-          </div>
+          {!nativeAndroid && (
+            <div className="flex items-center shrink-0">
+              <PWAInstallButton />
+            </div>
+          )}
         </div>
       </header>
 
@@ -261,9 +390,97 @@ export default function App() {
                       <QRCodeSVG value={pairShareUrl} size={156} level="M" />
                     </div>
                     <p className="text-xs text-slate-500 max-w-xs">
-                      Pindai QR ini dari kamera ponsel untuk langsung terhubung ke{' '}
-                      <span className="font-medium text-slate-700">{selfPeer.name}</span>.
+                      Pindai QR ini dari kamera ponsel atau buka linknya di browser PC untuk langsung
+                      terhubung ke <span className="font-medium text-slate-700">{selfPeer.name}</span>.
                     </p>
+                  </div>
+                )}
+
+                {nativeAndroid && (
+                  <div className="pt-3 border-t border-slate-100 space-y-2.5">
+                    {nativeServerInfo?.url ? (
+                      <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-medium text-slate-600">
+                            Alamat WiFi Server HP Ini
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyServerUrl()}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 rounded-md cursor-pointer"
+                          >
+                            {copiedServerUrl ? (
+                              <Check className="w-3.5 h-3.5 text-[#16A34A]" aria-hidden="true" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                            )}
+                            <span>{copiedServerUrl ? 'Tersalin' : 'Salin Link'}</span>
+                          </button>
+                        </div>
+                        <div className="text-sm font-mono font-semibold text-slate-900 break-all">
+                          {nativeServerInfo.url}
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-relaxed">
+                          Buka alamat di atas lewat browser PC Windows atau HP lain pada WiFi yang
+                          sama, atau pindai QR Code.
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-500">
+                        Aktifkan WiFi atau Hotspot agar alamat IP lokal muncul.
+                      </p>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => setShowHostSwitch((v) => !v)}
+                      className="text-xs font-medium text-[#2563EB] hover:underline cursor-pointer"
+                    >
+                      {showHostSwitch
+                        ? 'Tutup pengaturan server tujuan'
+                        : 'Pakai 2 APK? Hubungkan ke IP HP lain'}
+                    </button>
+
+                    {showHostSwitch && (
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          setCustomServerHost(hostInput);
+                        }}
+                        className="space-y-2 pt-1"
+                      >
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={hostInput}
+                            onChange={(e) => setHostInput(e.target.value)}
+                            placeholder="Contoh: 192.168.1.5:3000"
+                            className="min-w-0 flex-1 min-h-[40px] px-3 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                          />
+                          <button
+                            type="submit"
+                            className="min-h-[40px] px-3 py-1.5 text-xs font-medium text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg whitespace-nowrap cursor-pointer"
+                          >
+                            Sambungkan
+                          </button>
+                        </div>
+                        {customServerHost && (
+                          <div className="flex items-center justify-between text-[11px] text-slate-600">
+                            <span>Tersambung ke host: {customServerHost}</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setHostInput('');
+                                setCustomServerHost('');
+                              }}
+                              className="text-[#DC2626] hover:underline cursor-pointer"
+                            >
+                              Kembali ke HP ini
+                            </button>
+                          </div>
+                        )}
+                      </form>
+                    )}
                   </div>
                 )}
               </section>
@@ -650,7 +867,7 @@ export default function App() {
             </div>
 
             <div className="pt-4 border-t border-slate-200 space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
                 <div className="flex items-center gap-2.5">
                   <Terminal className="w-5 h-5 text-slate-700 shrink-0" aria-hidden="true" />
                   <div>
@@ -664,15 +881,40 @@ export default function App() {
                   </div>
                 </div>
 
-                <a
-                  href="/eztransfer-setup.txt"
-                  download="eztransfer-setup.txt"
-                  className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
-                >
-                  <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
-                  <span>Unduh Setup (.txt)</span>
-                </a>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={downloadingTxt}
+                    onClick={() => void handleDownloadTxt()}
+                    className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
+                    <span>{downloadingTxt ? 'Mengunduh...' : 'Unduh Setup (.txt)'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={copyingTxt}
+                    onClick={() => void handleCopyTxtContent()}
+                    className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Copy className="w-4 h-4 shrink-0" aria-hidden="true" />
+                    <span>{copyingTxt ? 'Menyalin...' : 'Salin Isi File (.txt)'}</span>
+                  </button>
+                </div>
               </div>
+
+              {txtFeedback && (
+                <div
+                  className={`rounded-lg px-3.5 py-2.5 text-xs leading-relaxed border ${
+                    txtFeedback.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                      : 'bg-red-50 border-red-200 text-red-700'
+                  }`}
+                >
+                  {txtFeedback.text}
+                </div>
+              )}
 
               <div className="rounded-xl bg-slate-900 text-slate-100 p-4 space-y-2.5">
                 <div className="flex items-center justify-between gap-2">

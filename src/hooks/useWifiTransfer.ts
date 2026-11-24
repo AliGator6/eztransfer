@@ -8,6 +8,15 @@ import type {
   TransferProgressState,
 } from '../types/transfer';
 import { detectDetailedDeviceInfo, detectDeviceInfo } from '../utils/format';
+import {
+  EzFileSaver,
+  EzWifiServer,
+  isNativeAndroid,
+  uint8ToBase64,
+  type NativeServerInfo,
+} from '../native/androidPlugins';
+
+const NATIVE_FLUSH_BYTES = 512 * 1024; // Flush every 512 KB to Android MediaStore
 
 const CHUNK_SIZE = 64 * 1024; // 64 KB chunks for safe, fast SCTP transfer
 const MAX_BUFFERED_AMOUNT = 1536 * 1024; // 1.5 MB backpressure cap
@@ -96,6 +105,14 @@ export function useWifiTransfer() {
       return [];
     }
   });
+  const [nativeServerInfo, setNativeServerInfo] = useState<NativeServerInfo | null>(null);
+  const [customServerHost, setCustomServerHostState] = useState<string>(() => {
+    try {
+      return localStorage.getItem('eztransfer_custom_host') || '';
+    } catch {
+      return '';
+    }
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -133,11 +150,15 @@ export function useWifiTransfer() {
   const singleFileHandleRef = useRef<FileSystemFileHandleLike | null>(null);
   const currentWritableRef = useRef<FileSystemWritableLike | null>(null);
   const currentBlobChunksRef = useRef<Uint8Array[]>([]);
+  const nativeChunkQueueRef = useRef<Uint8Array[]>([]);
+  const nativeChunkBytesRef = useRef(0);
+  const nativeSavingFileIdRef = useRef<string | null>(null);
   const currentReceiveFileRef = useRef<{
     index: number;
     file: RemoteFilePreview;
     receivedBytes: number;
     usingDisk: boolean;
+    usingNativeSaver: boolean;
   } | null>(null);
   const receiveWriteChainRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -218,6 +239,16 @@ export function useWifiTransfer() {
       }
       currentWritableRef.current = null;
     }
+    if (nativeSavingFileIdRef.current) {
+      try {
+        await EzFileSaver.closeFile({ transferId: nativeSavingFileIdRef.current, abort: true });
+      } catch {
+        // ignore native abort error
+      }
+      nativeSavingFileIdRef.current = null;
+    }
+    nativeChunkQueueRef.current = [];
+    nativeChunkBytesRef.current = 0;
     currentBlobChunksRef.current = [];
     currentReceiveFileRef.current = null;
     dirHandleRef.current = null;
@@ -344,22 +375,44 @@ export function useWifiTransfer() {
 
           receiveWriteChainRef.current = receiveWriteChainRef.current.then(async () => {
             let usingDisk = false;
+            let usingNativeSaver = false;
             currentBlobChunksRef.current = [];
             currentWritableRef.current = null;
+            nativeChunkQueueRef.current = [];
+            nativeChunkBytesRef.current = 0;
+            nativeSavingFileIdRef.current = null;
 
             const safeName = sanitizeFileName(fileMeta.name);
-            try {
-              if (singleFileHandleRef.current && offer && offer.files.length === 1) {
-                currentWritableRef.current = await singleFileHandleRef.current.createWritable();
+            if (isNativeAndroid()) {
+              try {
+                await EzFileSaver.openFile({
+                  transferId: fileId,
+                  fileName: safeName,
+                  mimeType: fileMeta.mimeType || 'application/octet-stream',
+                });
+                nativeSavingFileIdRef.current = fileId;
+                usingNativeSaver = true;
                 usingDisk = true;
-              } else if (dirHandleRef.current) {
-                const fh = await dirHandleRef.current.getFileHandle(safeName, { create: true });
-                currentWritableRef.current = await fh.createWritable();
-                usingDisk = true;
+              } catch {
+                usingNativeSaver = false;
+                nativeSavingFileIdRef.current = null;
               }
-            } catch {
-              currentWritableRef.current = null;
-              usingDisk = false;
+            }
+
+            if (!usingNativeSaver) {
+              try {
+                if (singleFileHandleRef.current && offer && offer.files.length === 1) {
+                  currentWritableRef.current = await singleFileHandleRef.current.createWritable();
+                  usingDisk = true;
+                } else if (dirHandleRef.current) {
+                  const fh = await dirHandleRef.current.getFileHandle(safeName, { create: true });
+                  currentWritableRef.current = await fh.createWritable();
+                  usingDisk = true;
+                }
+              } catch {
+                currentWritableRef.current = null;
+                usingDisk = false;
+              }
             }
 
             currentReceiveFileRef.current = {
@@ -367,6 +420,7 @@ export function useWifiTransfer() {
               file: fileMeta,
               receivedBytes: 0,
               usingDisk,
+              usingNativeSaver,
             };
 
             setProgress((prev) => ({
@@ -384,7 +438,24 @@ export function useWifiTransfer() {
             const current = currentReceiveFileRef.current;
             if (!current || current.file.id !== fileId) return;
 
-            if (current.usingDisk && currentWritableRef.current) {
+            if (current.usingNativeSaver) {
+              if (nativeChunkBytesRef.current > 0) {
+                const merged = new Uint8Array(nativeChunkBytesRef.current);
+                let offset = 0;
+                for (const part of nativeChunkQueueRef.current) {
+                  merged.set(part, offset);
+                  offset += part.byteLength;
+                }
+                nativeChunkQueueRef.current = [];
+                nativeChunkBytesRef.current = 0;
+                await EzFileSaver.appendChunk({
+                  transferId: fileId,
+                  base64: uint8ToBase64(merged),
+                });
+              }
+              await EzFileSaver.closeFile({ transferId: fileId, abort: false });
+              nativeSavingFileIdRef.current = null;
+            } else if (current.usingDisk && currentWritableRef.current) {
               await currentWritableRef.current.close();
               currentWritableRef.current = null;
             } else {
@@ -487,7 +558,24 @@ export function useWifiTransfer() {
         const current = currentReceiveFileRef.current;
         if (!current) return;
 
-        if (current.usingDisk && currentWritableRef.current) {
+        if (current.usingNativeSaver) {
+          nativeChunkQueueRef.current.push(uint8);
+          nativeChunkBytesRef.current += uint8.byteLength;
+          if (nativeChunkBytesRef.current >= NATIVE_FLUSH_BYTES) {
+            const merged = new Uint8Array(nativeChunkBytesRef.current);
+            let offset = 0;
+            for (const part of nativeChunkQueueRef.current) {
+              merged.set(part, offset);
+              offset += part.byteLength;
+            }
+            nativeChunkQueueRef.current = [];
+            nativeChunkBytesRef.current = 0;
+            await EzFileSaver.appendChunk({
+              transferId: current.file.id,
+              base64: uint8ToBase64(merged),
+            });
+          }
+        } else if (current.usingDisk && currentWritableRef.current) {
           await currentWritableRef.current.write(uint8);
         } else {
           currentBlobChunksRef.current.push(uint8);
@@ -576,10 +664,48 @@ export function useWifiTransfer() {
     let reconnectTimer: number | null = null;
     let attempt = 0;
 
-    const connectWs = () => {
-      if (closedByUnmount) return;
+    const resolveWsTarget = async (): Promise<string> => {
+      if (isNativeAndroid()) {
+        let info: NativeServerInfo | null = null;
+        try {
+          info = await EzWifiServer.startServer();
+          if (!closedByUnmount) {
+            setNativeServerInfo(info);
+          }
+        } catch {
+          info = null;
+        }
+
+        const custom = customServerHost.trim();
+        if (custom) {
+          if (custom.startsWith('ws://') || custom.startsWith('wss://')) {
+            return custom.endsWith('/ws') ? custom : `${custom.replace(/\/+$/, '')}/ws`;
+          }
+          if (custom.startsWith('http://') || custom.startsWith('https://')) {
+            const wsProto = custom.startsWith('https://') ? 'wss://' : 'ws://';
+            const rest = custom.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+            return `${wsProto}${rest}/ws`;
+          }
+          const cleanHost = custom.replace(/\/+$/, '');
+          const withPort = cleanHost.includes(':') ? cleanHost : `${cleanHost}:3000`;
+          return `ws://${withPort}/ws`;
+        }
+
+        if (info?.wsUrl) {
+          return info.wsUrl;
+        }
+        return 'ws://127.0.0.1:3000/ws';
+      }
+
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      return `${protocol}//${window.location.host}/ws`;
+    };
+
+    const connectWs = async () => {
+      if (closedByUnmount) return;
+      const wsUrl = await resolveWsTarget();
+      if (closedByUnmount) return;
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -724,7 +850,7 @@ export function useWifiTransfer() {
       };
     };
 
-    connectWs();
+    void connectWs();
 
     return () => {
       closedByUnmount = true;
@@ -732,7 +858,7 @@ export function useWifiTransfer() {
       wsRef.current?.close();
       void closePeerConnection();
     };
-  }, [closePeerConnection, createPeerConnection, sendWs]);
+  }, [closePeerConnection, createPeerConnection, customServerHost, sendWs]);
 
 
 
@@ -1041,8 +1167,11 @@ export function useWifiTransfer() {
     let usingDisk = false;
 
     // Attempt direct disk write via File System Access API (works in standalone Windows Edge/Chrome)
+    // Inside Android APK, EzFileSaver automatically writes directly to Download/EzTransfer.
     try {
-      if (offer.files.length === 1 && typeof window.showSaveFilePicker === 'function') {
+      if (isNativeAndroid()) {
+        usingDisk = true;
+      } else if (offer.files.length === 1 && typeof window.showSaveFilePicker === 'function') {
         singleFileHandleRef.current = await window.showSaveFilePicker({
           suggestedName: sanitizeFileName(offer.files[0].name),
         });
@@ -1153,6 +1282,20 @@ export function useWifiTransfer() {
     }
   }, []);
 
+  const setCustomServerHost = useCallback((host: string) => {
+    const cleaned = host.trim();
+    setCustomServerHostState(cleaned);
+    try {
+      if (cleaned) {
+        localStorage.setItem('eztransfer_custom_host', cleaned);
+      } else {
+        localStorage.removeItem('eztransfer_custom_host');
+      }
+    } catch {
+      // ignore storage restrictions
+    }
+  }, []);
+
   return {
     wsConnected,
     selfPeer,
@@ -1164,6 +1307,9 @@ export function useWifiTransfer() {
     incomingFilesProgress,
     progress,
     history,
+    nativeServerInfo,
+    customServerHost,
+    setCustomServerHost,
     lookupPairCode,
     setPairedPeer,
     addFilesToQueue,

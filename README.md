@@ -23,6 +23,14 @@ Untuk menjalankan ulang di lain waktu:
 cd ~/eztransfer && npm run dev
 ```
 
+## Build APK Android Otomatis di GitHub (100% Gratis)
+
+Repository ini sudah dilengkapi GitHub Actions (`.github/workflows/build-apk.yml`) berbasis Capacitor. Setiap kali Anda push ke branch `main`:
+
+1. GitHub otomatis mem-build **`EzTransfer.apk`**.
+2. Buka halaman repository GitHub Anda → klik menu **Releases** (atau tab **Actions**) → unduh **`EzTransfer.apk`** dan pasang langsung di HP Android Anda.
+3. Di dalam APK sudah tertanam server WiFi lokal + penyimpanan langsung ke folder **Download/EzTransfer**.
+
 ## Mengunggah ke GitHub (100% Gratis)
 
 Di dalam folder `~/eztransfer`:
@@ -30,7 +38,7 @@ Di dalam folder `~/eztransfer`:
 ```bash
 git init
 git add .
-git commit -m "Initial commit: EzTransfer"
+git commit -m "Build EzTransfer Android APK"
 git branch -M main
 git remote add origin https://github.com/USERNAME/eztransfer.git
 git push -u origin main
