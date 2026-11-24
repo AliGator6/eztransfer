@@ -662,6 +662,8 @@ export function useWifiTransfer() {
   useEffect(() => {
     let closedByUnmount = false;
     let reconnectTimer: number | null = null;
+    let discoveryTimer: number | null = null;
+    let activeWsUrl = '';
     let attempt = 0;
 
     const resolveWsTarget = async (): Promise<string> => {
@@ -691,6 +693,9 @@ export function useWifiTransfer() {
           return `ws://${withPort}/ws`;
         }
 
+        if (info?.recommendedWsUrl) {
+          return info.recommendedWsUrl;
+        }
         if (info?.wsUrl) {
           return info.wsUrl;
         }
@@ -705,6 +710,7 @@ export function useWifiTransfer() {
       if (closedByUnmount) return;
       const wsUrl = await resolveWsTarget();
       if (closedByUnmount) return;
+      activeWsUrl = wsUrl;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -852,9 +858,29 @@ export function useWifiTransfer() {
 
     void connectWs();
 
+    if (isNativeAndroid() && !customServerHost.trim()) {
+      discoveryTimer = window.setInterval(() => {
+        if (closedByUnmount || pcRef.current) return;
+        void EzWifiServer.getServerInfo()
+          .then((info) => {
+            if (closedByUnmount) return;
+            setNativeServerInfo(info);
+            const nextUrl = info.recommendedWsUrl || info.wsUrl;
+            if (nextUrl && activeWsUrl && nextUrl !== activeWsUrl) {
+              attempt = 0;
+              wsRef.current?.close();
+            }
+          })
+          .catch(() => {
+            // ignore discovery poll error
+          });
+      }, 3500);
+    }
+
     return () => {
       closedByUnmount = true;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (discoveryTimer !== null) window.clearInterval(discoveryTimer);
       wsRef.current?.close();
       void closePeerConnection();
     };

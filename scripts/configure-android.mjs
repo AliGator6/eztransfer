@@ -73,6 +73,7 @@ const manifestXml = `<?xml version="1.0" encoding="utf-8"?>
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -319,18 +320,20 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -370,12 +373,15 @@ public class EzWifiServerPlugin extends Plugin {
         }
     }
 
+    private static final int DISCOVERY_PORT = 45678;
     private ServerSocket serverSocket;
+    private DatagramSocket udpListenSocket;
     private int activePort = 0;
     private volatile boolean running = false;
     private ExecutorService executor;
     private final Map<String, PeerClient> peers = new ConcurrentHashMap<>();
     private final Map<String, String> codeToPeerId = new ConcurrentHashMap<>();
+    private final Map<String, long[]> discoveredApks = new ConcurrentHashMap<>();
     private final Random random = new Random();
 
     @Override
@@ -415,6 +421,8 @@ public class EzWifiServerPlugin extends Plugin {
                 running = true;
                 executor = Executors.newCachedThreadPool();
                 executor.submit(this::acceptLoop);
+                executor.submit(this::udpListenLoop);
+                executor.submit(this::udpAnnounceLoop);
                 return;
             } catch (IOException ignored) {
             }
@@ -430,6 +438,14 @@ public class EzWifiServerPlugin extends Plugin {
             }
             serverSocket = null;
         }
+        if (udpListenSocket != null) {
+            try {
+                udpListenSocket.close();
+            } catch (Exception ignored) {
+            }
+            udpListenSocket = null;
+        }
+        discoveredApks.clear();
         for (PeerClient p : peers.values()) {
             closePeer(p);
         }
@@ -441,6 +457,87 @@ public class EzWifiServerPlugin extends Plugin {
         }
     }
 
+    private long ipv4ToLong(String ip) {
+        if (ip == null || ip.isEmpty()) return Long.MAX_VALUE;
+        String[] parts = ip.split("\\\\.");
+        if (parts.length != 4) return Long.MAX_VALUE;
+        try {
+            long val = 0;
+            for (String p : parts) {
+                val = (val << 8) | (Integer.parseInt(p) & 0xFFL);
+            }
+            return val;
+        } catch (Exception e) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private void udpListenLoop() {
+        try {
+            DatagramSocket sock = new DatagramSocket(null);
+            sock.setReuseAddress(true);
+            sock.setBroadcast(true);
+            sock.bind(new InetSocketAddress(DISCOVERY_PORT));
+            udpListenSocket = sock;
+            byte[] buf = new byte[256];
+            while (running && !sock.isClosed()) {
+                DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                sock.receive(packet);
+                String msg = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
+                if (!msg.startsWith("EZTRANSFER|")) continue;
+                String[] parts = msg.split("\\\\|");
+                if (parts.length < 2) continue;
+                int remotePort;
+                try {
+                    remotePort = Integer.parseInt(parts[1].trim());
+                } catch (Exception e) {
+                    continue;
+                }
+                String senderIp = packet.getAddress() != null ? packet.getAddress().getHostAddress() : "";
+                String myIp = detectWifiIpv4();
+                if (senderIp != null && !senderIp.isEmpty() && !senderIp.equals(myIp) && !senderIp.startsWith("127.")) {
+                    discoveredApks.put(senderIp, new long[] { remotePort, System.currentTimeMillis() });
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void udpAnnounceLoop() {
+        try (DatagramSocket sock = new DatagramSocket()) {
+            sock.setBroadcast(true);
+            while (running) {
+                String myIp = detectWifiIpv4();
+                if (!myIp.isEmpty() && activePort > 0) {
+                    byte[] payload = ("EZTRANSFER|" + activePort).getBytes(StandardCharsets.UTF_8);
+                    try {
+                        sock.send(new DatagramPacket(payload, payload.length, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT));
+                    } catch (Exception ignored) {
+                    }
+                    try {
+                        Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+                        while (ifaces != null && ifaces.hasMoreElements()) {
+                            NetworkInterface iface = ifaces.nextElement();
+                            if (!iface.isUp() || iface.isLoopback()) continue;
+                            for (InterfaceAddress ia : iface.getInterfaceAddresses()) {
+                                InetAddress bcast = ia.getBroadcast();
+                                if (bcast != null) {
+                                    try {
+                                        sock.send(new DatagramPacket(payload, payload.length, bcast, DISCOVERY_PORT));
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                Thread.sleep(2000);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     private JSObject buildServerInfo() {
         String ip = detectWifiIpv4();
         String url = (running && activePort > 0 && !ip.isEmpty())
@@ -449,12 +546,39 @@ public class EzWifiServerPlugin extends Plugin {
         String wsUrl = (running && activePort > 0)
             ? "ws://127.0.0.1:" + activePort + "/ws"
             : "";
+
+        long now = System.currentTimeMillis();
+        String leaderIp = ip;
+        int leaderPort = activePort;
+        long leaderNum = ipv4ToLong(ip);
+
+        for (Map.Entry<String, long[]> entry : discoveredApks.entrySet()) {
+            long[] meta = entry.getValue();
+            if (now - meta[1] > 7000) {
+                discoveredApks.remove(entry.getKey());
+                continue;
+            }
+            long candidateNum = ipv4ToLong(entry.getKey());
+            if (candidateNum < leaderNum) {
+                leaderNum = candidateNum;
+                leaderIp = entry.getKey();
+                leaderPort = (int) meta[0];
+            }
+        }
+
+        String recommendedWsUrl = wsUrl;
+        if (running && !leaderIp.isEmpty() && !leaderIp.equals(ip) && leaderPort > 0) {
+            recommendedWsUrl = "ws://" + leaderIp + ":" + leaderPort + "/ws";
+        }
+
         JSObject obj = new JSObject();
         obj.put("running", running);
         obj.put("port", activePort);
         obj.put("ip", ip);
         obj.put("url", url);
         obj.put("wsUrl", wsUrl);
+        obj.put("recommendedWsUrl", recommendedWsUrl);
+        obj.put("leaderIp", leaderIp);
         return obj;
     }
 

@@ -19,7 +19,6 @@ import { QRCodeSVG } from 'qrcode.react';
 import { DeviceIcon } from './components/DeviceIcon';
 import { FilePreviewThumb } from './components/FilePreviewThumb';
 import { IncomingOfferModal } from './components/IncomingOfferModal';
-import { PWAInstallButton } from './components/PWAInstallButton';
 import { TransferMonitor } from './components/TransferMonitor';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useWifiTransfer } from './hooks/useWifiTransfer';
@@ -316,11 +315,7 @@ export default function App() {
             </button>
           </nav>
 
-          {!nativeAndroid && (
-            <div className="flex items-center shrink-0">
-              <PWAInstallButton />
-            </div>
-          )}
+          <div className="w-8 shrink-0" aria-hidden="true" />
         </div>
       </header>
 
@@ -857,103 +852,104 @@ export default function App() {
               </div>
 
               <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
-                <div className="text-xs font-semibold text-[#2563EB]">03. Aplikasi Windows</div>
-                <h2 className="text-sm font-bold text-slate-900">Simpan Langsung ke Folder</h2>
+                <div className="text-xs font-semibold text-[#2563EB]">03. APK Android Mandiri</div>
+                <h2 className="text-sm font-bold text-slate-900">Simpan ke Download/EzTransfer</h2>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Pasang aplikasi di Windows melalui Edge atau Chrome untuk membukanya dari Start Menu
-                  dan menulis file besar langsung ke drive Windows tanpa menumpuk di memori.
+                  APK EzTransfer menemukan perangkat lain di WiFi yang sama secara otomatis dan
+                  menyimpan file langsung ke folder Download/EzTransfer tanpa butuh browser Chrome.
                 </p>
               </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-200 space-y-4">
-              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5">
-                  <Terminal className="w-5 h-5 text-slate-700 shrink-0" aria-hidden="true" />
-                  <div>
-                    <h2 className="text-base font-bold text-slate-900">
-                      Unduh File Setup (.txt) untuk Termux & GitHub
-                    </h2>
-                    <p className="text-xs text-slate-500">
-                      100% gratis tanpa biaya server atau API berbayar. Simpan ke folder Download lalu
-                      panggil dari Termux.
-                    </p>
+            {!nativeAndroid && (
+              <div className="pt-4 border-t border-slate-200 space-y-4">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <Terminal className="w-5 h-5 text-slate-700 shrink-0" aria-hidden="true" />
+                    <div>
+                      <h2 className="text-base font-bold text-slate-900">
+                        Unduh File Setup (.txt) untuk Build APK di GitHub
+                      </h2>
+                      <p className="text-xs text-slate-500">
+                        Hanya mengekstrak kode ke ~/eztransfer untuk di-push ke GitHub Actions (tanpa
+                        menjalankan server web di Termux).
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={downloadingTxt}
+                      onClick={() => void handleDownloadTxt()}
+                      className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
+                      <span>{downloadingTxt ? 'Mengunduh...' : 'Unduh Setup (.txt)'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={copyingTxt}
+                      onClick={() => void handleCopyTxtContent()}
+                      className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <Copy className="w-4 h-4 shrink-0" aria-hidden="true" />
+                      <span>{copyingTxt ? 'Menyalin...' : 'Salin Isi File (.txt)'}</span>
+                    </button>
                   </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    disabled={downloadingTxt}
-                    onClick={() => void handleDownloadTxt()}
-                    className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                {txtFeedback && (
+                  <div
+                    className={`rounded-lg px-3.5 py-2.5 text-xs leading-relaxed border ${
+                      txtFeedback.type === 'success'
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-red-50 border-red-200 text-red-700'
+                    }`}
                   >
-                    <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
-                    <span>{downloadingTxt ? 'Mengunduh...' : 'Unduh Setup (.txt)'}</span>
-                  </button>
+                    {txtFeedback.text}
+                  </div>
+                )}
 
-                  <button
-                    type="button"
-                    disabled={copyingTxt}
-                    onClick={() => void handleCopyTxtContent()}
-                    className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <Copy className="w-4 h-4 shrink-0" aria-hidden="true" />
-                    <span>{copyingTxt ? 'Menyalin...' : 'Salin Isi File (.txt)'}</span>
-                  </button>
+                <div className="rounded-xl bg-slate-900 text-slate-100 p-4 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-slate-300">
+                      Jalankan di Termux untuk ekstrak kode lalu langsung push ke GitHub:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const cmd =
+                          'bash ~/storage/downloads/eztransfer-setup.txt && cd ~/eztransfer && git add . && git commit -m "Build APK" && git push';
+                        const ok = await copyPlainText(cmd);
+                        if (ok) {
+                          setCopiedTermuxCmd(true);
+                          window.setTimeout(() => setCopiedTermuxCmd(false), 2000);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-md cursor-pointer shrink-0"
+                    >
+                      {copiedTermuxCmd ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                      )}
+                      <span>{copiedTermuxCmd ? 'Tersalin' : 'Salin'}</span>
+                    </button>
+                  </div>
+                  <pre className="text-xs font-mono text-slate-200 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed">
+{`bash ~/storage/downloads/eztransfer-setup.txt
+cd ~/eztransfer && git add . && git commit -m "Build APK" && git push`}
+                  </pre>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Setelah push selesai, buka tab <strong className="text-slate-200">Releases</strong> atau{' '}
+                    <strong className="text-slate-200">Actions</strong> di GitHub untuk mengunduh{' '}
+                    <code className="text-slate-200">EzTransfer.apk</code>.
+                  </p>
                 </div>
               </div>
-
-              {txtFeedback && (
-                <div
-                  className={`rounded-lg px-3.5 py-2.5 text-xs leading-relaxed border ${
-                    txtFeedback.type === 'success'
-                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                      : 'bg-red-50 border-red-200 text-red-700'
-                  }`}
-                >
-                  {txtFeedback.text}
-                </div>
-              )}
-
-              <div className="rounded-xl bg-slate-900 text-slate-100 p-4 space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-slate-300">
-                    Setelah terunduh di folder Download, panggil di Termux dengan perintah:
-                  </span>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const cmd =
-                        'termux-setup-storage && bash ~/storage/downloads/eztransfer-setup.txt';
-                      try {
-                        await navigator.clipboard.writeText(cmd);
-                        setCopiedTermuxCmd(true);
-                        window.setTimeout(() => setCopiedTermuxCmd(false), 2000);
-                      } catch {
-                        // ignore clipboard errors
-                      }
-                    }}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-md cursor-pointer shrink-0"
-                  >
-                    {copiedTermuxCmd ? (
-                      <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" aria-hidden="true" />
-                    )}
-                    <span>{copiedTermuxCmd ? 'Tersalin' : 'Salin'}</span>
-                  </button>
-                </div>
-                <pre className="text-xs font-mono text-slate-200 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed">
-{`termux-setup-storage
-bash ~/storage/downloads/eztransfer-setup.txt`}
-                </pre>
-                <p className="text-[11px] text-slate-400 leading-relaxed">
-                  Script di dalam file .txt otomatis membuat folder <code className="text-slate-200">~/eztransfer</code>,
-                  mengekstrak semua kode sumber, memasang dependensi gratis, dan langsung menjalankan server.
-                </p>
-              </div>
-            </div>
+            )}
           </section>
         )}
       </main>

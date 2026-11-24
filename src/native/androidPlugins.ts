@@ -6,6 +6,8 @@ export interface NativeServerInfo {
   ip: string;
   url: string;
   wsUrl: string;
+  recommendedWsUrl?: string;
+  leaderIp?: string;
 }
 
 export interface EzWifiServerPluginInterface {

@@ -321,9 +321,9 @@ async function startServer() {
         '',
         'TARGET_DIR="$HOME/eztransfer"',
         'echo "============================================"',
-        'echo "  EzTransfer - Setup Termux 100% Free"',
+        'echo "  EzTransfer - Siapkan Kode untuk Build APK"',
         'echo "============================================"',
-        'echo "[1/4] Menyiapkan folder proyek di $TARGET_DIR..."',
+        'echo "[1/2] Menyiapkan folder proyek di $TARGET_DIR..."',
         'mkdir -p "$TARGET_DIR"',
         '',
         'B64_DEC="base64 -d"',
@@ -336,7 +336,7 @@ async function startServer() {
         '  $B64_DEC > "$1"',
         '}',
         '',
-        'echo "[2/4] Mengekstrak seluruh kode sumber..."',
+        'echo "[2/2] Mengekstrak semua file proyek APK..."',
       ];
 
       for (const item of collected) {
@@ -348,29 +348,10 @@ async function startServer() {
 
       lines.push(
         '',
-        'echo "[3/4] Memeriksa Node.js & Git..."',
-        'if ! command -v node >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then',
-        '  if [ -n "$PREFIX" ] && command -v pkg >/dev/null 2>&1; then',
-        '    pkg update -y && pkg install -y nodejs git',
-        '  else',
-        '    echo "Silakan pasang Node.js dan Git terlebih dahulu."',
-        '    exit 1',
-        '  fi',
-        'fi',
-        '',
-        'echo "[4/4] Memasang dependensi npm (100% open-source/gratis)..."',
-        'cd "$TARGET_DIR"',
-        'npm install --legacy-peer-deps',
-        '',
-        'WIFI_IP="$(ip -4 addr show wlan0 2>/dev/null | awk \'/inet /{print $2}\' | cut -d/ -f1 | head -n1)"',
         'echo ""',
-        'echo "Selesai! Aplikasi siap dijalankan."',
-        'if [ -n "$WIFI_IP" ]; then',
-        '  echo "Buka di browser HP/Laptop/Windows se-WiFi: http://$WIFI_IP:3000"',
-        'fi',
-        'echo "Untuk push ke GitHub gratis, lihat panduan di README.md."',
-        'echo "Menjalankan server di port 3000..."',
-        'npm run dev',
+        'echo "Selesai! Semua file untuk build APK sudah diekstrak ke $TARGET_DIR"',
+        'echo "Lanjutkan push ke GitHub agar Actions otomatis membuat EzTransfer.apk:"',
+        'echo "  cd ~/eztransfer && git add . && git commit -m \\"Build APK\\" && git push"',
         ''
       );
 

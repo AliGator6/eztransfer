@@ -1,45 +1,23 @@
 # EzTransfer
 
-Aplikasi kirim-terima file dan video berukuran besar via WiFi berbasis WebRTC Peer-to-Peer, responsif untuk HP, Tablet, dan Laptop/PC Windows, serta dapat dipasang sebagai aplikasi desktop Windows (PWA).
+Aplikasi Android APK kirim-terima file dan video berukuran besar via WiFi berbasis WebRTC Peer-to-Peer.
 
-**100% Gratis (Free & Open-Source)**: Tidak membutuhkan server berbayar, akun cloud, atau API key berbayar.
-
-## Menjalankan di Termux dari File Download (.txt)
-
-1. Unduh file **`eztransfer-setup.txt`** lewat aplikasi (tersimpan otomatis di folder **Download** HP Anda).
-2. Buka **Termux**, beri izin akses folder Download (cukup sekali):
-   ```bash
-   termux-setup-storage
-   ```
-3. Panggil file `.txt` tersebut:
-   ```bash
-   bash ~/storage/downloads/eztransfer-setup.txt
-   ```
-   Perintah ini otomatis mengekstrak seluruh kode ke `~/eztransfer`, memasang Node.js/Git & dependensi gratis, lalu menjalankan server di port `3000`.
-4. Cek IP WiFi HP Anda (`ip -4 addr show wlan0 | grep inet`), lalu buka `http://<IP_WIFI>:3000` di Laptop/Windows/HP lain yang satu WiFi.
-
-Untuk menjalankan ulang di lain waktu:
-```bash
-cd ~/eztransfer && npm run dev
-```
+- **100% Gratis & Mandiri (Offline WiFi):** Tidak membutuhkan Chrome PWA, Termux server, atau server cloud berbayar.
+- **Auto-Discovery WiFi:** Dua HP dengan aplikasi **EzTransfer.apk** pada WiFi yang sama otomatis saling menemukan, atau perangkat lain dapat membuka alamat lokal yang tampil di aplikasi.
+- **Simpan Langsung:** File dan video yang diterima di APK otomatis tersimpan ke folder **`Download/EzTransfer`**.
 
 ## Build APK Android Otomatis di GitHub (100% Gratis)
 
-Repository ini sudah dilengkapi GitHub Actions (`.github/workflows/build-apk.yml`) berbasis Capacitor. Setiap kali Anda push ke branch `main`:
+Repository ini dilengkapi workflow GitHub Actions (`.github/workflows/build-apk.yml`) berbasis Capacitor. Setiap kali kode di-push ke branch `main`:
 
 1. GitHub otomatis mem-build **`EzTransfer.apk`**.
-2. Buka halaman repository GitHub Anda → klik menu **Releases** (atau tab **Actions**) → unduh **`EzTransfer.apk`** dan pasang langsung di HP Android Anda.
-3. Di dalam APK sudah tertanam server WiFi lokal + penyimpanan langsung ke folder **Download/EzTransfer**.
+2. Buka halaman repository GitHub Anda → klik menu **Releases** (atau tab **Actions → Artifacts → EzTransfer-APK**) → unduh **`EzTransfer.apk`** dan pasang di HP Android Anda.
 
-## Mengunggah ke GitHub (100% Gratis)
+## Mengunggah / Memperbarui Kode ke GitHub dari Termux
 
-Di dalam folder `~/eztransfer`:
-
-```bash
-git init
-git add .
-git commit -m "Build EzTransfer Android APK"
-git branch -M main
-git remote add origin https://github.com/USERNAME/eztransfer.git
-git push -u origin main
-```
+1. Unduh file **`eztransfer-setup.txt`** (simpan di folder Download HP Anda).
+2. Ekstrak dan push ke GitHub:
+   ```bash
+   bash ~/storage/downloads/eztransfer-setup.txt
+   cd ~/eztransfer && git add . && git commit -m "Build APK" && git push
+   ```
