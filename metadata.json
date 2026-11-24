@@ -1,0 +1,6 @@
+{
+  "name": "Kinetik WiFi Transfer",
+  "description": "Kirim dan terima file maupun video berukuran besar secara langsung antarperangkat melalui jaringan WiFi lokal, siap dipasang di Windows dan ponsel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

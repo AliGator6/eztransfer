@@ -1,0 +1,774 @@
+import React, { useMemo, useRef, useState } from 'react';
+import {
+  ArrowDownLeft,
+  ArrowUpRight,
+  Check,
+  Copy,
+  Download,
+  FolderUp,
+  History,
+  Info,
+  QrCode,
+  Send,
+  Terminal,
+  Trash2,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
+import { DeviceIcon } from './components/DeviceIcon';
+import { FilePreviewThumb } from './components/FilePreviewThumb';
+import { IncomingOfferModal } from './components/IncomingOfferModal';
+import { PWAInstallButton } from './components/PWAInstallButton';
+import { TransferMonitor } from './components/TransferMonitor';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { useWifiTransfer } from './hooks/useWifiTransfer';
+import type { PeerInfo } from './types/transfer';
+import { formatBytes, formatDuration, formatSpeed, getDeviceLabel } from './utils/format';
+import { createBatchItem } from './utils/mediaPreview';
+
+type ActiveTab = 'transfer' | 'riwayat' | 'panduan';
+
+export default function App() {
+  const isOnline = useOnlineStatus();
+  const {
+    wsConnected,
+    selfPeer,
+    nearbyPeers,
+    pairedPeer,
+    pairError,
+    queue,
+    incomingOffer,
+    incomingFilesProgress,
+    progress,
+    history,
+    lookupPairCode,
+    setPairedPeer,
+    addFilesToQueue,
+    removeQueueItem,
+    clearQueue,
+    sendBatchToPeer,
+    acceptIncomingOffer,
+    rejectIncomingOffer,
+    cancelTransfer,
+    resetProgress,
+    clearHistory,
+  } = useWifiTransfer();
+
+  const [activeTab, setActiveTab] = useState<ActiveTab>('transfer');
+  const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
+  const [codeInput, setCodeInput] = useState('');
+  const [showQrPanel, setShowQrPanel] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedTermuxCmd, setCopiedTermuxCmd] = useState(false);
+
+  const [isDragging, setIsDragging] = useState(false);
+  const [extractingFiles, setExtractingFiles] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Merge nearby WiFi peers + explicitly paired peer without duplicates
+  const availablePeers = useMemo(() => {
+    const map = new Map<string, PeerInfo>();
+    for (const p of nearbyPeers) map.set(p.id, p);
+    if (pairedPeer && !map.has(pairedPeer.id)) {
+      map.set(pairedPeer.id, pairedPeer);
+    }
+    return Array.from(map.values());
+  }, [nearbyPeers, pairedPeer]);
+
+  const selectedPeer = useMemo(() => {
+    if (selectedPeerId) {
+      const found = availablePeers.find((p) => p.id === selectedPeerId);
+      if (found) return found;
+    }
+    if (pairedPeer) return pairedPeer;
+    return availablePeers.length === 1 ? availablePeers[0] : null;
+  }, [availablePeers, pairedPeer, selectedPeerId]);
+
+  const totalQueueBytes = useMemo(
+    () => queue.reduce((sum, item) => sum + item.size, 0),
+    [queue]
+  );
+
+  const isTransferring =
+    progress.phase === 'connecting' ||
+    progress.phase === 'waiting-accept' ||
+    progress.phase === 'transferring';
+
+  const handleFilesSelected = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setExtractingFiles(true);
+    try {
+      const files = Array.from(fileList);
+      const items = await Promise.all(files.map((f) => createBatchItem(f)));
+      addFilesToQueue(items);
+    } finally {
+      setExtractingFiles(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(false);
+    void handleFilesSelected(e.dataTransfer.files);
+  };
+
+  const handleCopyCode = async () => {
+    if (!selfPeer) return;
+    try {
+      await navigator.clipboard.writeText(selfPeer.pairCode);
+      setCopiedCode(true);
+      window.setTimeout(() => setCopiedCode(false), 1800);
+    } catch {
+      // ignore clipboard restrictions
+    }
+  };
+
+  const handlePairSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    lookupPairCode(codeInput);
+  };
+
+  const pairShareUrl = selfPeer
+    ? `${window.location.origin}/?pair=${selfPeer.pairCode}`
+    : window.location.origin;
+
+  return (
+    <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
+      {/* Top Bar: 3-zone on tablet/laptop, compact brand + install CTA on mobile */}
+      <header className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 h-14 md:h-16 flex items-center justify-between gap-4 md:gap-8">
+          <button
+            type="button"
+            onClick={() => setActiveTab('transfer')}
+            className="flex items-center gap-2.5 text-base sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <span className="w-8 h-8 rounded-lg bg-[#2563EB] text-white flex items-center justify-center shrink-0">
+              <Wifi className="w-4 h-4" aria-hidden="true" />
+            </span>
+            <span>EzTransfer</span>
+          </button>
+
+          <nav className="hidden md:flex items-center gap-7 text-sm font-medium">
+            <button
+              type="button"
+              onClick={() => setActiveTab('transfer')}
+              className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'transfer'
+                  ? 'border-[#2563EB] text-slate-900'
+                  : 'border-transparent text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Transfer
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('riwayat')}
+              className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'riwayat'
+                  ? 'border-[#2563EB] text-slate-900'
+                  : 'border-transparent text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Riwayat{history.length > 0 ? ` (${history.length})` : ''}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('panduan')}
+              className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'panduan'
+                  ? 'border-[#2563EB] text-slate-900'
+                  : 'border-transparent text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Panduan
+            </button>
+          </nav>
+
+          <div className="flex items-center shrink-0">
+            <PWAInstallButton />
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 max-w-6xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 pt-4 pb-20 md:py-6">
+        {activeTab === 'transfer' && (
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-4 sm:gap-5 lg:gap-6 items-start">
+            {/* Left Column: Device Identity, WiFi Auto-Discovery & QR/6-Digit Pairing */}
+            <div className="md:col-span-5 space-y-4 sm:space-y-5">
+              {/* Self Device Card */}
+              <section className="rounded-xl bg-white border border-slate-200 p-4 sm:p-5 space-y-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-medium text-slate-500">Perangkat Ini (Terdeteksi Otomatis)</div>
+                    <h1 className="mt-1 text-lg font-bold text-slate-900 truncate">
+                      {selfPeer?.name || 'Mendeteksi perangkat...'}
+                    </h1>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {selfPeer ? getDeviceLabel(selfPeer.deviceType) : 'Memuat'} ·{' '}
+                      <span className={wsConnected ? 'text-[#16A34A] font-medium' : 'text-[#D97706]'}>
+                        {wsConnected ? 'Siap di jaringan WiFi' : 'Menghubungkan ulang...'}
+                      </span>
+                    </p>
+                  </div>
+                </div>
+
+                {/* 6-Digit Pairing Code & QR Toggle */}
+                <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs text-slate-500">Kode Perangkat Anda</div>
+                    <div className="text-xl font-bold tracking-widest text-slate-900 font-mono tabular-nums mt-0.5">
+                      {selfPeer?.pairCode || '------'}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCopyCode}
+                      disabled={!selfPeer}
+                      className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+                    >
+                      {copiedCode ? (
+                        <Check className="w-3.5 h-3.5 text-[#16A34A]" aria-hidden="true" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                      )}
+                      <span>{copiedCode ? 'Tersalin' : 'Salin'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowQrPanel((v) => !v)}
+                      className={`inline-flex items-center gap-1.5 min-h-[40px] px-3 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+                        showQrPanel
+                          ? 'bg-[#2563EB] text-white'
+                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                      }`}
+                    >
+                      <QrCode className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>QR Code</span>
+                    </button>
+                  </div>
+                </div>
+
+                {showQrPanel && selfPeer && (
+                  <div className="pt-3 border-t border-slate-100 flex flex-col items-center text-center space-y-2.5">
+                    <div className="p-3 bg-white border border-slate-200 rounded-xl">
+                      <QRCodeSVG value={pairShareUrl} size={156} level="M" />
+                    </div>
+                    <p className="text-xs text-slate-500 max-w-xs">
+                      Pindai QR ini dari kamera ponsel untuk langsung terhubung ke{' '}
+                      <span className="font-medium text-slate-700">{selfPeer.name}</span>.
+                    </p>
+                  </div>
+                )}
+              </section>
+
+              {/* Discovered WiFi Peers + Manual 6-Digit Connect */}
+              <section className="rounded-xl bg-white border border-slate-200 p-4 sm:p-5 space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Perangkat di WiFi yang Sama
+                  </h2>
+                  <span className="text-xs text-slate-500 font-mono tabular-nums">
+                    {availablePeers.length} terdeteksi
+                  </span>
+                </div>
+
+                {availablePeers.length === 0 ? (
+                  <div className="py-6 px-4 rounded-lg bg-slate-50 border border-dashed border-slate-200 text-center space-y-1.5">
+                    <p className="text-sm font-medium text-slate-700">
+                      Belum ada perangkat lain terlihat
+                    </p>
+                    <p className="text-xs text-slate-500 leading-relaxed">
+                      Buka aplikasi ini di PC Windows atau ponsel lain pada WiFi yang sama, atau
+                      masukkan kode 6 digit di bawah.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {availablePeers.map((peer) => {
+                      const isSelected = selectedPeer?.id === peer.id;
+                      return (
+                        <button
+                          key={peer.id}
+                          type="button"
+                          onClick={() => setSelectedPeerId(peer.id)}
+                          className={`w-full min-h-[56px] p-3 rounded-lg border text-left flex items-center justify-between gap-3 transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'border-[#2563EB] bg-blue-50/60'
+                              : 'border-slate-200 bg-white hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div
+                              className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+                                isSelected
+                                  ? 'bg-[#2563EB] text-white'
+                                  : 'bg-slate-100 text-slate-600'
+                              }`}
+                            >
+                              <DeviceIcon type={peer.deviceType} className="w-4 h-4" />
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold text-slate-900 truncate">
+                                {peer.name}
+                              </div>
+                              <div className="text-xs text-slate-500 font-mono tabular-nums">
+                                {getDeviceLabel(peer.deviceType)} · Kode {peer.pairCode}
+                              </div>
+                            </div>
+                          </div>
+
+                          <span
+                            className={`text-xs font-medium shrink-0 ${
+                              isSelected ? 'text-[#2563EB]' : 'text-slate-500'
+                            }`}
+                          >
+                            {isSelected ? 'Dipilih' : 'Pilih'}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Manual 6-Digit Code Lookup */}
+                <form onSubmit={handlePairSubmit} className="pt-3 border-t border-slate-100 space-y-2">
+                  <label htmlFor="pair-code-input" className="block text-xs font-medium text-slate-600">
+                    Atau hubungkan dengan Kode 6 Digit
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="pair-code-input"
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={codeInput}
+                      onChange={(e) => setCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder="Contoh: 482910"
+                      className="min-w-0 flex-1 min-h-[44px] px-3 py-2 text-sm font-mono tabular-nums tracking-wider bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#2563EB]"
+                    />
+                    <button
+                      type="submit"
+                      className="min-h-[44px] px-4 py-2 text-sm font-medium text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      Hubungkan
+                    </button>
+                  </div>
+                  {pairError && <p className="text-xs text-[#DC2626]">{pairError}</p>}
+                  {pairedPeer && (
+                    <div className="flex items-center justify-between text-xs text-[#16A34A]">
+                      <span>Terhubung dengan {pairedPeer.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => setPairedPeer(null)}
+                        className="text-slate-500 hover:text-slate-800 underline cursor-pointer"
+                      >
+                        Lepas
+                      </button>
+                    </div>
+                  )}
+                </form>
+              </section>
+            </div>
+
+            {/* Right Column: Active Transfer Monitor, Dropzone & Batch Media Preview Queue */}
+            <div className="md:col-span-7 space-y-4 sm:space-y-5">
+              <TransferMonitor
+                progress={progress}
+                outgoingQueue={queue}
+                incomingFiles={incomingFilesProgress}
+                onCancel={() => void cancelTransfer()}
+                onDismiss={resetProgress}
+              />
+
+              {/* File Dropzone & Picker */}
+              <section className="rounded-xl bg-white border border-slate-200 p-4 sm:p-5 space-y-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      Antrean File & Video
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Pilih atau tarik banyak file sekaligus termasuk video berukuran besar
+                    </p>
+                  </div>
+                  {queue.length > 0 && !isTransferring && (
+                    <button
+                      type="button"
+                      onClick={clearQueue}
+                      className="min-h-[36px] px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-[#DC2626] hover:bg-red-50 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      Kosongkan
+                    </button>
+                  )}
+                </div>
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => void handleFilesSelected(e.target.files)}
+                />
+
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  className={`rounded-xl border-2 border-dashed p-6 sm:p-8 text-center transition-colors cursor-pointer ${
+                    isDragging
+                      ? 'border-[#2563EB] bg-blue-50/70'
+                      : 'border-slate-300 bg-slate-50/70 hover:border-slate-400 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="mx-auto w-11 h-11 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-[#2563EB]">
+                    <FolderUp className="w-5 h-5" aria-hidden="true" />
+                  </div>
+                  <p className="mt-3 text-sm font-semibold text-slate-900">
+                    {extractingFiles
+                      ? 'Menyiapkan pratinjau media...'
+                      : 'Tarik file ke sini atau klik untuk memilih'}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Mendukung video 4K/MKV/MP4 bergiga-giga, foto, arsip ZIP, dan semua jenis file
+                  </p>
+                </div>
+
+                {/* Batch Queue List with Media Previews */}
+                {queue.length > 0 && (
+                  <div className="space-y-3 pt-1">
+                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-white max-h-80 overflow-y-auto">
+                      {queue.map((item) => (
+                        <div
+                          key={item.id}
+                          className="p-3 flex items-center gap-3 hover:bg-slate-50/60"
+                        >
+                          <FilePreviewThumb
+                            category={item.category}
+                            previewDataUrl={item.previewDataUrl}
+                            name={item.name}
+                          />
+
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-medium text-slate-900 truncate">
+                              {item.name}
+                            </p>
+                            <p className="text-xs text-slate-500 font-mono tabular-nums mt-0.5">
+                              {formatBytes(item.size)}
+                              {item.duration ? ` · ${formatDuration(item.duration)}` : ''}
+                              {item.width && item.height ? ` · ${item.width}×${item.height}` : ''}
+                              {item.status === 'transferring' && ` · ${item.progress}%`}
+                              {item.status === 'completed' && ' · Terkirim'}
+                            </p>
+                          </div>
+
+                          {!isTransferring && (
+                            <button
+                              type="button"
+                              onClick={() => removeQueueItem(item.id)}
+                              className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-[#DC2626] hover:bg-red-50 transition-colors shrink-0 cursor-pointer"
+                              aria-label={`Hapus ${item.name}`}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Primary Send Action Bar */}
+                    <div className="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="text-xs text-slate-600 font-mono tabular-nums">
+                        Total {queue.length} file · {formatBytes(totalQueueBytes)}
+                        {selectedPeer && (
+                          <span className="font-sans text-slate-700">
+                            {' '}
+                            → Tujuan: <strong>{selectedPeer.name}</strong>
+                          </span>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        disabled={!selectedPeer || isTransferring || queue.length === 0}
+                        onClick={() => selectedPeer && void sendBatchToPeer(selectedPeer)}
+                        className="w-full sm:w-auto inline-flex items-center justify-center gap-2 min-h-[48px] sm:min-h-[44px] px-5 py-2.5 text-sm font-semibold text-white bg-[#2563EB] hover:bg-blue-700 disabled:bg-slate-300 disabled:text-slate-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:cursor-not-allowed"
+                      >
+                        <Send className="w-4 h-4 shrink-0" aria-hidden="true" />
+                        <span className="truncate max-w-[220px] sm:max-w-none">
+                          {selectedPeer
+                            ? `Kirim ke ${selectedPeer.name}`
+                            : 'Pilih Perangkat Tujuan'}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'riwayat' && (
+          <section className="rounded-xl bg-white border border-slate-200 p-5 sm:p-6 space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-2.5">
+                <History className="w-5 h-5 text-slate-700" aria-hidden="true" />
+                <h1 className="text-lg font-bold text-slate-900">Riwayat Transfer</h1>
+              </div>
+              {history.length > 0 && (
+                <button
+                  type="button"
+                  onClick={clearHistory}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-medium text-slate-600 hover:text-[#DC2626] hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                >
+                  Bersihkan Riwayat
+                </button>
+              )}
+            </div>
+
+            {history.length === 0 ? (
+              <div className="py-12 text-center text-sm text-slate-500">
+                Belum ada riwayat transfer pada perangkat ini.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 border-t border-slate-100">
+                {history.map((item) => {
+                  const speed = formatSpeed(item.avgSpeedBytesPerSec);
+                  const dateLabel = new Date(item.timestamp).toLocaleTimeString('id-ID', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  });
+                  const statusLabel =
+                    item.status === 'completed'
+                      ? 'Selesai'
+                      : item.status === 'rejected'
+                        ? 'Ditolak'
+                        : item.status === 'cancelled'
+                          ? 'Dibatalkan'
+                          : 'Gagal';
+                  const statusColor =
+                    item.status === 'completed' ? 'text-[#16A34A]' : 'text-[#DC2626]';
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center shrink-0">
+                          {item.direction === 'send' ? (
+                            <ArrowUpRight className="w-4 h-4 text-[#2563EB]" aria-hidden="true" />
+                          ) : (
+                            <ArrowDownLeft className="w-4 h-4 text-[#16A34A]" aria-hidden="true" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-slate-900 truncate">
+                            {item.firstFileName}
+                            {item.fileCount > 1 ? ` (+${item.fileCount - 1} lainnya)` : ''}
+                          </p>
+                          <p className="text-xs text-slate-500">
+                            {item.direction === 'send' ? 'Dikirim ke' : 'Diterima dari'}{' '}
+                            <span className="font-medium text-slate-700">{item.peerName}</span> ·{' '}
+                            <span className="font-mono tabular-nums">{dateLabel}</span>
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-4 text-xs font-mono tabular-nums pl-12 sm:pl-0 shrink-0">
+                        <span className="text-slate-600">{formatBytes(item.totalBytes)}</span>
+                        {item.status === 'completed' && (
+                          <span className="text-slate-600">{speed.mbPerSec}</span>
+                        )}
+                        <span className={`font-sans font-semibold ${statusColor}`}>
+                          {statusLabel}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'panduan' && (
+          <section className="rounded-xl bg-white border border-slate-200 p-5 sm:p-6 space-y-6">
+            <div className="flex items-center gap-2.5">
+              <Info className="w-5 h-5 text-[#2563EB]" aria-hidden="true" />
+              <h1 className="text-lg font-bold text-slate-900">
+                Cara Kerja & Tips Video Ukuran Besar
+              </h1>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="text-xs font-semibold text-[#2563EB]">01. Koneksi Langsung WiFi</div>
+                <h2 className="text-sm font-bold text-slate-900">Tanpa Upload ke Server</h2>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Server hanya mempertemukan perangkat. File dan video mengalir langsung antarperangkat
+                  melalui WebRTC DataChannel di jaringan WiFi Anda.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="text-xs font-semibold text-[#2563EB]">02. Aman untuk Video 4K</div>
+                <h2 className="text-sm font-bold text-slate-900">Streaming Potongan 64 KB</h2>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  File dipecah per potongan kecil dengan kontrol buffer otomatis sehingga browser
+                  tidak mengalami kehabisan RAM saat mengirim video bergiga-giga.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="text-xs font-semibold text-[#2563EB]">03. Aplikasi Windows</div>
+                <h2 className="text-sm font-bold text-slate-900">Simpan Langsung ke Folder</h2>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Pasang aplikasi di Windows melalui Edge atau Chrome untuk membukanya dari Start Menu
+                  dan menulis file besar langsung ke drive Windows tanpa menumpuk di memori.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-slate-200 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <Terminal className="w-5 h-5 text-slate-700 shrink-0" aria-hidden="true" />
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      Unduh File Setup (.txt) untuk Termux & GitHub
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      100% gratis tanpa biaya server atau API berbayar. Simpan ke folder Download lalu
+                      panggil dari Termux.
+                    </p>
+                  </div>
+                </div>
+
+                <a
+                  href="/eztransfer-setup.txt"
+                  download="eztransfer-setup.txt"
+                  className="inline-flex items-center justify-center gap-2 min-h-[44px] px-4 py-2 text-sm font-medium text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
+                  <span>Unduh Setup (.txt)</span>
+                </a>
+              </div>
+
+              <div className="rounded-xl bg-slate-900 text-slate-100 p-4 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-300">
+                    Setelah terunduh di folder Download, panggil di Termux dengan perintah:
+                  </span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const cmd =
+                        'termux-setup-storage && bash ~/storage/downloads/eztransfer-setup.txt';
+                      try {
+                        await navigator.clipboard.writeText(cmd);
+                        setCopiedTermuxCmd(true);
+                        window.setTimeout(() => setCopiedTermuxCmd(false), 2000);
+                      } catch {
+                        // ignore clipboard errors
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-md cursor-pointer shrink-0"
+                  >
+                    {copiedTermuxCmd ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                    )}
+                    <span>{copiedTermuxCmd ? 'Tersalin' : 'Salin'}</span>
+                  </button>
+                </div>
+                <pre className="text-xs font-mono text-slate-200 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed">
+{`termux-setup-storage
+bash ~/storage/downloads/eztransfer-setup.txt`}
+                </pre>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Script di dalam file .txt otomatis membuat folder <code className="text-slate-200">~/eztransfer</code>,
+                  mengekstrak semua kode sumber, memasang dependensi gratis, dan langsung menjalankan server.
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+      </main>
+
+      {/* Mobile Bottom Tab Bar (Thumb Zone) */}
+      <nav
+        aria-label="Navigasi Utama Seluler"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur border-t border-slate-200 grid grid-cols-3 h-14"
+      >
+        <button
+          type="button"
+          onClick={() => setActiveTab('transfer')}
+          className={`flex flex-col items-center justify-center min-h-[44px] text-[11px] font-medium transition-colors cursor-pointer ${
+            activeTab === 'transfer' ? 'text-[#2563EB]' : 'text-slate-500'
+          }`}
+        >
+          <Send className="w-5 h-5 mb-0.5" aria-hidden="true" />
+          <span>Transfer</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('riwayat')}
+          className={`flex flex-col items-center justify-center min-h-[44px] text-[11px] font-medium transition-colors cursor-pointer ${
+            activeTab === 'riwayat' ? 'text-[#2563EB]' : 'text-slate-500'
+          }`}
+        >
+          <History className="w-5 h-5 mb-0.5" aria-hidden="true" />
+          <span>Riwayat{history.length > 0 ? ` (${history.length})` : ''}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('panduan')}
+          className={`flex flex-col items-center justify-center min-h-[44px] text-[11px] font-medium transition-colors cursor-pointer ${
+            activeTab === 'panduan' ? 'text-[#2563EB]' : 'text-slate-500'
+          }`}
+        >
+          <Info className="w-5 h-5 mb-0.5" aria-hidden="true" />
+          <span>Panduan</span>
+        </button>
+      </nav>
+
+      {/* 1-to-1 Receiver Confirmation Modal */}
+      {incomingOffer && (
+        <IncomingOfferModal
+          offer={incomingOffer}
+          onAccept={() => void acceptIncomingOffer()}
+          onReject={() => void rejectIncomingOffer()}
+        />
+      )}
+
+      {/* Offline Status Banner */}
+      {!isOnline && (
+        <div className="fixed bottom-16 md:bottom-4 left-4 z-50 flex items-center gap-2 rounded-lg bg-[#D97706] px-3.5 py-2 text-xs font-medium text-white shadow-lg">
+          <WifiOff className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>Koneksi WiFi / jaringan terputus</span>
+        </div>
+      )}
+    </div>
+  );
+}
