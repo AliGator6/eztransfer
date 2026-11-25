@@ -20,6 +20,7 @@ interface PeerRecord {
   deviceType: DeviceType;
   networkKey: string;
   status: 'idle' | 'transferring';
+  lanUrl?: string;
   ws: WebSocket;
   isAlive: boolean;
 }
@@ -30,6 +31,7 @@ interface PublicPeer {
   name: string;
   deviceType: DeviceType;
   status: 'idle' | 'transferring';
+  lanUrl?: string;
 }
 
 function normalizeNetworkKey(req: http.IncomingMessage): string {
@@ -72,6 +74,7 @@ function toPublicPeer(peer: PeerRecord): PublicPeer {
     name: peer.name,
     deviceType: peer.deviceType,
     status: peer.status,
+    ...(peer.lanUrl ? { lanUrl: peer.lanUrl } : {}),
   };
 }
 
@@ -183,6 +186,9 @@ async function startServer() {
         if (msg.status === 'idle' || msg.status === 'transferring') {
           record.status = msg.status;
         }
+        if (typeof msg.lanUrl === 'string') {
+          record.lanUrl = msg.lanUrl.trim().slice(0, 120);
+        }
         sendJson(ws, { type: 'self:updated', self: toPublicPeer(record) });
         broadcastNetworkPeers(record.networkKey);
         return;
@@ -214,7 +220,11 @@ async function startServer() {
         type === 'webrtc:offer' ||
         type === 'webrtc:answer' ||
         type === 'webrtc:ice' ||
-        type === 'webrtc:cancel'
+        type === 'webrtc:cancel' ||
+        type === 'direct:offer' ||
+        type === 'direct:accept' ||
+        type === 'direct:complete' ||
+        type === 'direct:cancel'
       ) {
         const targetPeerId = typeof msg.targetPeerId === 'string' ? msg.targetPeerId : '';
         const target = peers.get(targetPeerId);

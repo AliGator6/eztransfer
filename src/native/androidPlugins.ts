@@ -1,4 +1,4 @@
-import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
 
 export interface NativeServerInfo {
   running: boolean;
@@ -10,12 +10,35 @@ export interface NativeServerInfo {
   leaderIp?: string;
 }
 
+export interface DirectFileProgressEvent {
+  transferId: string;
+  fileId: string;
+  bytesReceived: number;
+  totalBytes: number;
+}
+
+export interface DirectFileCompleteEvent {
+  transferId: string;
+  fileId: string;
+  savedPath: string;
+  contentUri?: string;
+}
+
 export interface EzWifiServerPluginInterface {
   startServer(): Promise<NativeServerInfo>;
   getServerInfo(): Promise<NativeServerInfo>;
+  addListener(
+    eventName: 'directFileProgress',
+    listenerFunc: (event: DirectFileProgressEvent) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'directFileComplete',
+    listenerFunc: (event: DirectFileCompleteEvent) => void
+  ): Promise<PluginListenerHandle>;
 }
 
 export interface EzFileSaverPluginInterface {
+  ensureStoragePermission(): Promise<{ granted: boolean }>;
   openFile(options: {
     transferId: string;
     fileName: string;

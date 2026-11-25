@@ -6,6 +6,7 @@ export interface PeerInfo {
   name: string;
   deviceType: DeviceType;
   status: 'idle' | 'transferring';
+  lanUrl?: string;
 }
 
 export type FileTransferStatus =

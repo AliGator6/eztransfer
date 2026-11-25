@@ -18,11 +18,12 @@ import {
   type NativeServerInfo,
 } from '../native/androidPlugins';
 
-const NATIVE_FLUSH_BYTES = 512 * 1024; // Flush every 512 KB to Android MediaStore
+const NATIVE_FLUSH_BYTES = 2 * 1024 * 1024; // Flush every 2 MB to Android MediaStore (WebRTC fallback)
+const READ_BLOCK_SIZE = 2 * 1024 * 1024; // Read 2 MB blocks at a time to avoid per-64KB disk IPC overhead
 
 const CHUNK_SIZE = 64 * 1024; // 64 KB chunks for safe, fast SCTP transfer
-const MAX_BUFFERED_AMOUNT = 1536 * 1024; // 1.5 MB backpressure cap
-const LOW_BUFFERED_THRESHOLD = 512 * 1024; // 512 KB low-water mark
+const MAX_BUFFERED_AMOUNT = 6 * 1024 * 1024; // 6 MB backpressure cap
+const LOW_BUFFERED_THRESHOLD = 2 * 1024 * 1024; // 2 MB low-water mark
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -87,6 +88,27 @@ function triggerBrowserDownload(blob: Blob, fileName: string) {
   }, 1500);
 }
 
+async function probeLanReachable(lanUrl?: string): Promise<boolean> {
+  if (!lanUrl || window.location.protocol !== 'http:' || !lanUrl.startsWith('http://')) {
+    return false;
+  }
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 1600);
+  try {
+    const res = await fetch(`${lanUrl.replace(/\/+$/, '')}/api/health`, {
+      method: 'GET',
+      mode: 'cors',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export function useWifiTransfer() {
   const [wsConnected, setWsConnected] = useState(false);
   const [selfPeer, setSelfPeer] = useState<PeerInfo | null>(null);
@@ -120,6 +142,8 @@ export function useWifiTransfer() {
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
   const queueRef = useRef<BatchFileItem[]>([]);
   const selfPeerRef = useRef<PeerInfo | null>(null);
+  const nearbyPeersRef = useRef<PeerInfo[]>([]);
+  const lanUrlRef = useRef<string>('');
   const initialDevice = detectDeviceInfo();
   const deviceNameRef = useRef<string>(initialDevice.defaultName);
   const deviceTypeRef = useRef(initialDevice.deviceType);
@@ -130,6 +154,16 @@ export function useWifiTransfer() {
   const activeTransferIdRef = useRef<string | null>(null);
   const acceptResolverRef = useRef<((accepted: boolean) => void) | null>(null);
   const fileAckResolverRef = useRef<((fileId: string) => void) | null>(null);
+
+  // Direct LAN TCP mode refs
+  const directTransferRef = useRef<{
+    isDirect: boolean;
+    targetPeerId: string;
+    transferId: string;
+  } | null>(null);
+  const directOfferRef = useRef<IncomingOffer | null>(null);
+  const activeXhrRef = useRef<XMLHttpRequest | null>(null);
+  const directBytesByFileRef = useRef<Map<string, number>>(new Map());
 
   // Speed sliding window refs
   const speedSamplesRef = useRef<Array<{ time: number; bytes: number }>>([]);
@@ -233,6 +267,18 @@ export function useWifiTransfer() {
 
   const closePeerConnection = useCallback(async () => {
     stopSpeedTicker();
+    if (activeXhrRef.current) {
+      try {
+        activeXhrRef.current.abort();
+      } catch {
+        // ignore abort error
+      }
+      activeXhrRef.current = null;
+    }
+    directTransferRef.current = null;
+    directOfferRef.current = null;
+    directBytesByFileRef.current.clear();
+
     if (currentWritableRef.current) {
       try {
         await currentWritableRef.current.abort();
@@ -709,6 +755,117 @@ export function useWifiTransfer() {
     [attachDataChannel, closePeerConnection, sendWs]
   );
 
+  // Direct LAN TCP native event listeners (receiver side progress & completion)
+  useEffect(() => {
+    if (!isNativeAndroid()) return;
+    let cancelled = false;
+    const handles: Array<{ remove: () => Promise<void> }> = [];
+
+    const setupListeners = async () => {
+      try {
+        const progHandle = await EzWifiServer.addListener('directFileProgress', (ev) => {
+          const offer = activeIncomingOfferRef.current;
+          if (!offer || offer.transferId !== ev.transferId) return;
+
+          const prevBytes = directBytesByFileRef.current.get(ev.fileId) || 0;
+          const nextBytes = Math.max(prevBytes, ev.bytesReceived);
+          const delta = nextBytes - prevBytes;
+          directBytesByFileRef.current.set(ev.fileId, nextBytes);
+
+          if (delta > 0) {
+            transferredBytesRef.current += delta;
+            speedSamplesRef.current.push({ time: Date.now(), bytes: delta });
+          }
+
+          const fileIndex = offer.files.findIndex((f) => f.id === ev.fileId);
+          const fileMeta = fileIndex >= 0 ? offer.files[fileIndex] : undefined;
+          const denom = fileMeta?.size || ev.totalBytes || 1;
+          const pct = denom > 0 ? Math.min(100, Math.round((nextBytes / denom) * 100)) : 100;
+
+          if (fileIndex >= 0) {
+            setProgress((prev) => ({
+              ...prev,
+              activeFileIndex: fileIndex,
+            }));
+          }
+
+          setIncomingFilesProgress((prev) =>
+            prev.map((item) =>
+              item.id === ev.fileId ? { ...item, bytesReceived: nextBytes, progress: pct } : item
+            )
+          );
+        });
+        if (!cancelled) {
+          handles.push(progHandle);
+        } else {
+          void progHandle.remove();
+        }
+
+        const doneHandle = await EzWifiServer.addListener('directFileComplete', (ev) => {
+          const offer = activeIncomingOfferRef.current;
+          if (!offer || offer.transferId !== ev.transferId) return;
+
+          const fileMeta = offer.files.find((f) => f.id === ev.fileId);
+          if (fileMeta) {
+            const prevBytes = directBytesByFileRef.current.get(ev.fileId) || 0;
+            const delta = Math.max(0, fileMeta.size - prevBytes);
+            directBytesByFileRef.current.set(ev.fileId, fileMeta.size);
+            if (delta > 0) {
+              transferredBytesRef.current += delta;
+              speedSamplesRef.current.push({ time: Date.now(), bytes: delta });
+            }
+
+            const alreadySaved = receivedBatchFilesRef.current.some((f) => f.id === fileMeta.id);
+            if (!alreadySaved) {
+              receivedBatchFilesRef.current.push({
+                id: fileMeta.id,
+                name: fileMeta.name,
+                size: fileMeta.size,
+                mimeType: fileMeta.mimeType,
+                category: fileMeta.category,
+                savedPath: ev.savedPath,
+                contentUri: ev.contentUri,
+                peerName: offer.fromPeer.name || 'Pengirim',
+                timestamp: Date.now(),
+              });
+            }
+          }
+
+          setIncomingFilesProgress((prev) =>
+            prev.map((item) =>
+              item.id === ev.fileId
+                ? {
+                    ...item,
+                    bytesReceived: item.size,
+                    progress: 100,
+                    done: true,
+                    savedPath: ev.savedPath,
+                    contentUri: ev.contentUri,
+                  }
+                : item
+            )
+          );
+        });
+        if (!cancelled) {
+          handles.push(doneHandle);
+        } else {
+          void doneHandle.remove();
+        }
+      } catch {
+        // ignore listener setup issues on non-native environments
+      }
+    };
+
+    void setupListeners();
+
+    return () => {
+      cancelled = true;
+      for (const h of handles) {
+        void h.remove();
+      }
+    };
+  }, []);
+
   // WebSocket signaling lifecycle
   useEffect(() => {
     let closedByUnmount = false;
@@ -724,6 +881,9 @@ export function useWifiTransfer() {
           info = await EzWifiServer.startServer();
           if (!closedByUnmount) {
             setNativeServerInfo(info);
+            if (info.url) {
+              lanUrlRef.current = info.url;
+            }
           }
         } catch {
           info = null;
@@ -774,6 +934,7 @@ export function useWifiTransfer() {
             name: deviceNameRef.current,
             deviceType: deviceTypeRef.current,
             status: 'idle',
+            ...(lanUrlRef.current ? { lanUrl: lanUrlRef.current } : {}),
           })
         );
 
@@ -786,6 +947,7 @@ export function useWifiTransfer() {
                 type: 'peer:update',
                 name: detailed.name,
                 deviceType: detailed.deviceType,
+                ...(lanUrlRef.current ? { lanUrl: lanUrlRef.current } : {}),
               })
             );
           }
@@ -812,7 +974,10 @@ export function useWifiTransfer() {
         }
 
         if (msg.type === 'peers:update') {
-          setNearbyPeers((msg.peers as PeerInfo[]) || []);
+          const list = (msg.peers as PeerInfo[]) || [];
+          nearbyPeersRef.current = list;
+          setNearbyPeers(list);
+          setPairedPeer((prev) => (prev ? list.find((p) => p.id === prev.id) || prev : null));
           return;
         }
 
@@ -827,10 +992,126 @@ export function useWifiTransfer() {
         }
 
         if (msg.type === 'signal:error') {
+          if (acceptResolverRef.current) {
+            acceptResolverRef.current(false);
+            acceptResolverRef.current = null;
+          }
           setProgress((prev) => ({
             ...prev,
             phase: 'error',
             errorMessage: String(msg.error || 'Perangkat tujuan tidak dapat dijangkau.'),
+          }));
+          void closePeerConnection();
+          return;
+        }
+
+        if (msg.type === 'direct:offer') {
+          const fromPeer = msg.fromPeer as PeerInfo;
+          const transferId = String(msg.transferId || '');
+          const files = (msg.files as RemoteFilePreview[]) || [];
+          const totalBytes = Number(msg.totalBytes || files.reduce((sum, f) => sum + f.size, 0));
+          if (!fromPeer || !transferId || files.length === 0) return;
+
+          await closePeerConnection();
+          const offer: IncomingOffer = {
+            transferId,
+            fromPeer,
+            files,
+            totalBytes,
+          };
+          directOfferRef.current = offer;
+          directTransferRef.current = {
+            isDirect: true,
+            targetPeerId: fromPeer.id,
+            transferId,
+          };
+          activeIncomingOfferRef.current = offer;
+          activeRemotePeerRef.current = fromPeer;
+          activeTransferIdRef.current = transferId;
+          setIncomingOffer(offer);
+          return;
+        }
+
+        if (msg.type === 'direct:accept') {
+          const accepted = Boolean(msg.accepted);
+          if (acceptResolverRef.current) {
+            acceptResolverRef.current(accepted);
+            acceptResolverRef.current = null;
+          }
+          return;
+        }
+
+        if (msg.type === 'direct:complete') {
+          stopSpeedTicker();
+          const offer = activeIncomingOfferRef.current;
+          const elapsedSec = Math.max((Date.now() - transferStartTimeRef.current) / 1000, 0.2);
+          const avgSpeed = offer ? offer.totalBytes / elapsedSec : 0;
+
+          if (offer) {
+            const persistedFiles: ReceivedFileRecord[] = receivedBatchFilesRef.current.map(
+              ({ previewUrl: _omit, ...rest }) => rest
+            );
+            appendHistory({
+              id: offer.transferId,
+              direction: 'receive',
+              peerName: offer.fromPeer.name,
+              fileCount: offer.files.length,
+              totalBytes: offer.totalBytes,
+              firstFileName: offer.files[0]?.name || 'File',
+              avgSpeedBytesPerSec: avgSpeed,
+              status: 'completed',
+              timestamp: Date.now(),
+              files: persistedFiles,
+            });
+          }
+
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'completed',
+            transferredBytes: totalBytesRef.current,
+            speedBytesPerSec: 0,
+            etaSeconds: 0,
+          }));
+          activeIncomingOfferRef.current = null;
+          await closePeerConnection();
+          return;
+        }
+
+        if (msg.type === 'direct:cancel') {
+          cancelFlagRef.current = true;
+          if (acceptResolverRef.current) {
+            acceptResolverRef.current(false);
+            acceptResolverRef.current = null;
+          }
+          if (activeXhrRef.current) {
+            try {
+              activeXhrRef.current.abort();
+            } catch {
+              // ignore
+            }
+            activeXhrRef.current = null;
+          }
+          setIncomingOffer(null);
+          const offer = activeIncomingOfferRef.current;
+          if (offer) {
+            appendHistory({
+              id: offer.transferId,
+              direction: 'receive',
+              peerName: offer.fromPeer.name,
+              fileCount: offer.files.length,
+              totalBytes: offer.totalBytes,
+              firstFileName: offer.files[0]?.name || 'File',
+              avgSpeedBytesPerSec: 0,
+              status: 'cancelled',
+              timestamp: Date.now(),
+            });
+            activeIncomingOfferRef.current = null;
+          }
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'cancelled',
+            speedBytesPerSec: 0,
+            etaSeconds: null,
           }));
           void closePeerConnection();
           return;
@@ -909,17 +1190,25 @@ export function useWifiTransfer() {
 
     void connectWs();
 
-    if (isNativeAndroid() && !customServerHost.trim()) {
+    if (isNativeAndroid()) {
       discoveryTimer = window.setInterval(() => {
-        if (closedByUnmount || pcRef.current) return;
+        if (closedByUnmount || pcRef.current || directTransferRef.current) return;
         void EzWifiServer.getServerInfo()
           .then((info) => {
             if (closedByUnmount) return;
             setNativeServerInfo(info);
-            const nextUrl = info.recommendedWsUrl || info.wsUrl;
-            if (nextUrl && activeWsUrl && nextUrl !== activeWsUrl) {
-              attempt = 0;
-              wsRef.current?.close();
+            if (info.url && info.url !== lanUrlRef.current) {
+              lanUrlRef.current = info.url;
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(JSON.stringify({ type: 'peer:update', lanUrl: info.url }));
+              }
+            }
+            if (!customServerHost.trim()) {
+              const nextUrl = info.recommendedWsUrl || info.wsUrl;
+              if (nextUrl && activeWsUrl && nextUrl !== activeWsUrl) {
+                attempt = 0;
+                wsRef.current?.close();
+              }
             }
           })
           .catch(() => {
@@ -935,7 +1224,7 @@ export function useWifiTransfer() {
       wsRef.current?.close();
       void closePeerConnection();
     };
-  }, [closePeerConnection, createPeerConnection, customServerHost, sendWs]);
+  }, [appendHistory, closePeerConnection, createPeerConnection, customServerHost, sendWs, stopSpeedTicker]);
 
 
 
@@ -969,9 +1258,12 @@ export function useWifiTransfer() {
   }, []);
 
   const sendBatchToPeer = useCallback(
-    async (targetPeer: PeerInfo) => {
+    async (targetPeerArg: PeerInfo) => {
       const filesToSend = queueRef.current;
       if (filesToSend.length === 0) return;
+
+      const freshPeer = nearbyPeersRef.current.find((p) => p.id === targetPeerArg.id);
+      const targetPeer = freshPeer ? { ...targetPeerArg, ...freshPeer } : targetPeerArg;
 
       cancelFlagRef.current = false;
       const transferId = `tx-${Date.now()}`;
@@ -1003,8 +1295,213 @@ export function useWifiTransfer() {
 
       try {
         await closePeerConnection();
+        activeRemotePeerRef.current = targetPeer;
         sendWs({ type: 'peer:update', status: 'transferring' });
 
+        // Prefer Direct LAN HTTP/TCP Streaming when receiver's LAN endpoint is directly reachable (full WiFi speed!)
+        const targetLanUrl = targetPeer.lanUrl?.trim() || '';
+        const canUseDirectLan = targetLanUrl ? await probeLanReachable(targetLanUrl) : false;
+
+        if (canUseDirectLan && !cancelFlagRef.current) {
+          directTransferRef.current = {
+            isDirect: true,
+            targetPeerId: targetPeer.id,
+            transferId,
+          };
+
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'waiting-accept',
+            usingDirectDiskWrite: true,
+          }));
+
+          sendWs({
+            type: 'direct:offer',
+            targetPeerId: targetPeer.id,
+            transferId,
+            files: filesToSend.map((item) => ({
+              id: item.id,
+              name: item.name,
+              size: item.size,
+              mimeType: item.mimeType,
+              category: item.category,
+              previewDataUrl: item.previewDataUrl,
+              duration: item.duration,
+              width: item.width,
+              height: item.height,
+            } satisfies RemoteFilePreview)),
+            totalBytes,
+          });
+
+          const accepted = await new Promise<boolean>((resolve) => {
+            acceptResolverRef.current = resolve;
+          });
+
+          if (!accepted || cancelFlagRef.current) {
+            const wasCancelled = cancelFlagRef.current;
+            setProgress((prev) => ({
+              ...prev,
+              phase: wasCancelled ? 'cancelled' : 'rejected',
+              speedBytesPerSec: 0,
+              etaSeconds: null,
+            }));
+            setQueue((prev) =>
+              prev.map((item) => ({ ...item, status: wasCancelled ? 'cancelled' : 'queued' }))
+            );
+            appendHistory({
+              id: transferId,
+              direction: 'send',
+              peerName: targetPeer.name,
+              fileCount: filesToSend.length,
+              totalBytes,
+              firstFileName: filesToSend[0].name,
+              avgSpeedBytesPerSec: 0,
+              status: wasCancelled ? 'cancelled' : 'rejected',
+              timestamp: Date.now(),
+            });
+            await closePeerConnection();
+            return;
+          }
+
+          setProgress((prev) => ({ ...prev, phase: 'transferring', usingDirectDiskWrite: true }));
+          startSpeedTicker();
+
+          for (let i = 0; i < filesToSend.length; i++) {
+            if (cancelFlagRef.current) break;
+            const item = filesToSend[i];
+
+            setProgress((prev) => ({ ...prev, activeFileIndex: i }));
+            setQueue((prev) =>
+              prev.map((q) => (q.id === item.id ? { ...q, status: 'transferring' } : q))
+            );
+
+            await new Promise<void>((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              activeXhrRef.current = xhr;
+              const qs = new URLSearchParams({
+                transferId,
+                fileId: item.id,
+                fileName: item.name,
+                mimeType: item.mimeType || 'application/octet-stream',
+                fileSize: String(item.size),
+              });
+              const uploadUrl = `${targetLanUrl.replace(/\/+$/, '')}/api/direct-upload?${qs.toString()}`;
+              let lastLoaded = 0;
+              let lastUiUpdate = 0;
+
+              xhr.open('POST', uploadUrl, true);
+              xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+              xhr.upload.onprogress = (ev) => {
+                const loaded = Math.min(ev.loaded, item.size > 0 ? item.size : ev.loaded);
+                const delta = Math.max(0, loaded - lastLoaded);
+                lastLoaded = loaded;
+                if (delta > 0) {
+                  transferredBytesRef.current += delta;
+                  speedSamplesRef.current.push({ time: Date.now(), bytes: delta });
+                }
+                const now = Date.now();
+                if (now - lastUiUpdate >= 120 || loaded >= item.size) {
+                  lastUiUpdate = now;
+                  const pct =
+                    item.size > 0 ? Math.min(100, Math.round((loaded / item.size) * 100)) : 100;
+                  setQueue((prev) =>
+                    prev.map((q) =>
+                      q.id === item.id ? { ...q, bytesTransferred: loaded, progress: pct } : q
+                    )
+                  );
+                }
+              };
+
+              xhr.onload = () => {
+                activeXhrRef.current = null;
+                if (xhr.status >= 200 && xhr.status < 300) {
+                  const remaining = Math.max(0, item.size - lastLoaded);
+                  if (remaining > 0) {
+                    transferredBytesRef.current += remaining;
+                    speedSamplesRef.current.push({ time: Date.now(), bytes: remaining });
+                  }
+                  resolve();
+                } else {
+                  let errMsg = `Gagal mengirim file (HTTP ${xhr.status}).`;
+                  try {
+                    const parsed = JSON.parse(xhr.responseText);
+                    if (parsed?.error) errMsg = String(parsed.error);
+                  } catch {
+                    // ignore JSON parse failure
+                  }
+                  reject(new Error(errMsg));
+                }
+              };
+
+              xhr.onerror = () => {
+                activeXhrRef.current = null;
+                reject(new Error('Koneksi Direct WiFi TCP terputus di tengah pengiriman.'));
+              };
+
+              xhr.onabort = () => {
+                activeXhrRef.current = null;
+                reject(new Error('__CANCELLED__'));
+              };
+
+              xhr.send(item.file);
+            });
+
+            if (cancelFlagRef.current) break;
+
+            setQueue((prev) =>
+              prev.map((q) =>
+                q.id === item.id
+                  ? { ...q, bytesTransferred: q.size, progress: 100, status: 'completed' }
+                  : q
+              )
+            );
+          }
+
+          if (cancelFlagRef.current) {
+            setProgress((prev) => ({
+              ...prev,
+              phase: 'cancelled',
+              speedBytesPerSec: 0,
+              etaSeconds: null,
+            }));
+            await closePeerConnection();
+            return;
+          }
+
+          sendWs({
+            type: 'direct:complete',
+            targetPeerId: targetPeer.id,
+            transferId,
+          });
+          stopSpeedTicker();
+          const elapsedSec = Math.max((Date.now() - transferStartTimeRef.current) / 1000, 0.2);
+          const avgSpeed = totalBytes / elapsedSec;
+
+          appendHistory({
+            id: transferId,
+            direction: 'send',
+            peerName: targetPeer.name,
+            fileCount: filesToSend.length,
+            totalBytes,
+            firstFileName: filesToSend[0].name,
+            avgSpeedBytesPerSec: avgSpeed,
+            status: 'completed',
+            timestamp: Date.now(),
+          });
+
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'completed',
+            transferredBytes: totalBytes,
+            speedBytesPerSec: 0,
+            etaSeconds: 0,
+          }));
+          await closePeerConnection();
+          return;
+        }
+
+        // WebRTC fallback (browser peers or non-direct networks) with 2 MB read-ahead buffer
         const pc = createPeerConnection(targetPeer);
         const dc = pc.createDataChannel('eztransfer', { ordered: true });
         attachDataChannel(dc);
@@ -1093,7 +1590,7 @@ export function useWifiTransfer() {
           return;
         }
 
-        // Start streaming chunks
+        // Start streaming chunks with 2 MB block reads
         setProgress((prev) => ({ ...prev, phase: 'transferring' }));
         startSpeedTicker();
 
@@ -1109,45 +1606,58 @@ export function useWifiTransfer() {
           sendDcJson({ type: 'file-start', fileId: item.id, index: i });
 
           let offset = 0;
+          let lastUiTick = 0;
           while (offset < item.file.size) {
             if (cancelFlagRef.current) break;
-            if (dc.readyState !== 'open') {
-              throw new Error('Saluran transfer terputus di tengah pengiriman.');
-            }
 
-            if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-              await new Promise<void>((resolve) => {
-                let done = false;
-                const finish = () => {
-                  if (done) return;
-                  done = true;
-                  dc.removeEventListener('bufferedamountlow', onLow);
-                  window.clearTimeout(fallbackTimer);
-                  resolve();
-                };
-                const onLow = () => finish();
-                const fallbackTimer = window.setTimeout(finish, 40);
-                dc.addEventListener('bufferedamountlow', onLow);
-              });
-            }
+            const blockEnd = Math.min(offset + READ_BLOCK_SIZE, item.file.size);
+            const blockBuffer = await item.file.slice(offset, blockEnd).arrayBuffer();
+            const blockView = new Uint8Array(blockBuffer);
 
-            const end = Math.min(offset + CHUNK_SIZE, item.file.size);
-            const sliceBuffer = await item.file.slice(offset, end).arrayBuffer();
-            dc.send(sliceBuffer);
+            let innerOffset = 0;
+            while (innerOffset < blockView.byteLength) {
+              if (cancelFlagRef.current) break;
+              if (dc.readyState !== 'open') {
+                throw new Error('Saluran transfer terputus di tengah pengiriman.');
+              }
 
-            const sentLen = sliceBuffer.byteLength;
-            offset = end;
-            transferredBytesRef.current += sentLen;
-            speedSamplesRef.current.push({ time: Date.now(), bytes: sentLen });
+              if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await new Promise<void>((resolve) => {
+                  let done = false;
+                  const finish = () => {
+                    if (done) return;
+                    done = true;
+                    dc.removeEventListener('bufferedamountlow', onLow);
+                    window.clearTimeout(fallbackTimer);
+                    resolve();
+                  };
+                  const onLow = () => finish();
+                  const fallbackTimer = window.setTimeout(finish, 80);
+                  dc.addEventListener('bufferedamountlow', onLow);
+                });
+              }
 
-            const pct = item.size > 0 ? Math.min(100, Math.round((offset / item.size) * 100)) : 100;
-            // Throttle per-file state updates slightly for smooth 60fps UI
-            if (pct === 100 || offset % (CHUNK_SIZE * 8) === 0) {
-              setQueue((prev) =>
-                prev.map((q) =>
-                  q.id === item.id ? { ...q, bytesTransferred: offset, progress: pct } : q
-                )
-              );
+              const chunkEnd = Math.min(innerOffset + CHUNK_SIZE, blockView.byteLength);
+              const chunkSlice = blockView.subarray(innerOffset, chunkEnd);
+              dc.send(chunkSlice as Uint8Array<ArrayBuffer>);
+
+              const sentLen = chunkSlice.byteLength;
+              innerOffset = chunkEnd;
+              offset += sentLen;
+              transferredBytesRef.current += sentLen;
+              speedSamplesRef.current.push({ time: Date.now(), bytes: sentLen });
+
+              const now = Date.now();
+              if (now - lastUiTick >= 120 || offset >= item.size) {
+                lastUiTick = now;
+                const pct =
+                  item.size > 0 ? Math.min(100, Math.round((offset / item.size) * 100)) : 100;
+                setQueue((prev) =>
+                  prev.map((q) =>
+                    q.id === item.id ? { ...q, bytesTransferred: offset, progress: pct } : q
+                  )
+                );
+              }
             }
           }
 
@@ -1200,6 +1710,16 @@ export function useWifiTransfer() {
         }));
         await closePeerConnection();
       } catch (err) {
+        if (cancelFlagRef.current || (err instanceof Error && err.message === '__CANCELLED__')) {
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'cancelled',
+            speedBytesPerSec: 0,
+            etaSeconds: null,
+          }));
+          await closePeerConnection();
+          return;
+        }
         const msg = err instanceof Error ? err.message : 'Terjadi kesalahan saat transfer.';
         setProgress((prev) => ({
           ...prev,
@@ -1242,24 +1762,45 @@ export function useWifiTransfer() {
     dirHandleRef.current = null;
     singleFileHandleRef.current = null;
     let usingDisk = false;
+    const isDirect = Boolean(directOfferRef.current && directOfferRef.current.transferId === offer.transferId);
 
     // Attempt direct disk write via File System Access API (works in standalone Windows Edge/Chrome)
-    // Inside Android APK, EzFileSaver automatically writes directly to Download/EzTransfer.
+    // Inside Android APK, EzFileSaver/EzStorageHelper automatically writes directly to Download/EzTransfer.
     try {
       if (isNativeAndroid()) {
+        const perm = await EzFileSaver.ensureStoragePermission();
+        if (!perm.granted) {
+          setProgress((prev) => ({
+            ...prev,
+            phase: 'error',
+            errorMessage: 'Izin penyimpanan diperlukan untuk menyimpan file ke folder Download.',
+          }));
+          if (isDirect) {
+            sendWs({
+              type: 'direct:accept',
+              targetPeerId: offer.fromPeer.id,
+              transferId: offer.transferId,
+              accepted: false,
+            });
+          } else {
+            sendDcJson({ type: 'batch-reject', transferId: offer.transferId });
+          }
+          setIncomingOffer(null);
+          activeIncomingOfferRef.current = null;
+          await closePeerConnection();
+          return;
+        }
         usingDisk = true;
-      } else if (offer.files.length === 1 && typeof window.showSaveFilePicker === 'function') {
+      } else if (!isDirect && offer.files.length === 1 && typeof window.showSaveFilePicker === 'function') {
         singleFileHandleRef.current = await window.showSaveFilePicker({
           suggestedName: sanitizeFileName(offer.files[0].name),
         });
         usingDisk = true;
-      } else if (offer.files.length > 1 && typeof window.showDirectoryPicker === 'function') {
+      } else if (!isDirect && offer.files.length > 1 && typeof window.showDirectoryPicker === 'function') {
         dirHandleRef.current = await window.showDirectoryPicker({ mode: 'readwrite' });
         usingDisk = true;
       }
     } catch (err) {
-      // User cancelled native picker or iframe blocked picker -> fallback cleanly or abort only if not AbortError?
-      // If SecurityError (e.g. iframe), fall back to browser download seamlessly.
       const errName = err instanceof Error ? err.name : '';
       if (errName === 'AbortError') {
         return; // Keep confirmation dialog open so user can pick folder or decline
@@ -1270,8 +1811,11 @@ export function useWifiTransfer() {
     }
 
     setIncomingOffer(null);
+    activeTransferIdRef.current = offer.transferId;
     totalBytesRef.current = offer.totalBytes;
     transferredBytesRef.current = 0;
+    receivedBatchFilesRef.current = [];
+    directBytesByFileRef.current.clear();
 
     setIncomingFilesProgress(
       offer.files.map((f) => ({
@@ -1299,15 +1843,34 @@ export function useWifiTransfer() {
 
     sendWs({ type: 'peer:update', status: 'transferring' });
     startSpeedTicker();
-    sendDcJson({ type: 'batch-accept', transferId: offer.transferId });
-  }, [incomingOffer, sendDcJson, sendWs, startSpeedTicker]);
+    if (isDirect) {
+      sendWs({
+        type: 'direct:accept',
+        targetPeerId: offer.fromPeer.id,
+        transferId: offer.transferId,
+        accepted: true,
+      });
+    } else {
+      sendDcJson({ type: 'batch-accept', transferId: offer.transferId });
+    }
+  }, [closePeerConnection, incomingOffer, sendDcJson, sendWs, startSpeedTicker]);
 
   const rejectIncomingOffer = useCallback(async () => {
     const offer = incomingOffer;
     if (!offer) return;
+    const isDirect = Boolean(directOfferRef.current && directOfferRef.current.transferId === offer.transferId);
     setIncomingOffer(null);
     activeIncomingOfferRef.current = null;
-    sendDcJson({ type: 'batch-reject', transferId: offer.transferId });
+    if (isDirect) {
+      sendWs({
+        type: 'direct:accept',
+        targetPeerId: offer.fromPeer.id,
+        transferId: offer.transferId,
+        accepted: false,
+      });
+    } else {
+      sendDcJson({ type: 'batch-reject', transferId: offer.transferId });
+    }
     appendHistory({
       id: offer.transferId,
       direction: 'receive',
@@ -1320,13 +1883,30 @@ export function useWifiTransfer() {
       timestamp: Date.now(),
     });
     await closePeerConnection();
-  }, [appendHistory, closePeerConnection, incomingOffer, sendDcJson]);
+  }, [appendHistory, closePeerConnection, incomingOffer, sendDcJson, sendWs]);
 
   const cancelTransfer = useCallback(async () => {
     cancelFlagRef.current = true;
-    sendDcJson({ type: 'transfer-cancel', transferId: activeTransferIdRef.current });
-    if (activeRemotePeerRef.current) {
-      sendWs({ type: 'webrtc:cancel', targetPeerId: activeRemotePeerRef.current.id });
+    const activeDirect = directTransferRef.current;
+    if (activeXhrRef.current) {
+      try {
+        activeXhrRef.current.abort();
+      } catch {
+        // ignore
+      }
+      activeXhrRef.current = null;
+    }
+    if (activeDirect?.isDirect) {
+      sendWs({
+        type: 'direct:cancel',
+        targetPeerId: activeDirect.targetPeerId,
+        transferId: activeDirect.transferId,
+      });
+    } else {
+      sendDcJson({ type: 'transfer-cancel', transferId: activeTransferIdRef.current });
+      if (activeRemotePeerRef.current) {
+        sendWs({ type: 'webrtc:cancel', targetPeerId: activeRemotePeerRef.current.id });
+      }
     }
     if (acceptResolverRef.current) {
       acceptResolverRef.current(false);
@@ -1336,6 +1916,7 @@ export function useWifiTransfer() {
       fileAckResolverRef.current('__cancelled__');
       fileAckResolverRef.current = null;
     }
+    setIncomingOffer(null);
     setProgress((prev) => ({
       ...prev,
       phase: 'cancelled',
