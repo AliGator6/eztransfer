@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   BatchFileItem,
+  IncomingFileProgress,
   IncomingOffer,
   PeerInfo,
+  ReceivedFileRecord,
   RemoteFilePreview,
   TransferHistoryItem,
   TransferProgressState,
@@ -93,9 +95,7 @@ export function useWifiTransfer() {
   const [pairError, setPairError] = useState<string | null>(null);
   const [queue, setQueue] = useState<BatchFileItem[]>([]);
   const [incomingOffer, setIncomingOffer] = useState<IncomingOffer | null>(null);
-  const [incomingFilesProgress, setIncomingFilesProgress] = useState<
-    Array<RemoteFilePreview & { bytesReceived: number; progress: number; done: boolean }>
-  >([]);
+  const [incomingFilesProgress, setIncomingFilesProgress] = useState<IncomingFileProgress[]>([]);
   const [progress, setProgress] = useState<TransferProgressState>(INITIAL_PROGRESS);
   const [history, setHistory] = useState<TransferHistoryItem[]>(() => {
     try {
@@ -153,6 +153,8 @@ export function useWifiTransfer() {
   const nativeChunkQueueRef = useRef<Uint8Array[]>([]);
   const nativeChunkBytesRef = useRef(0);
   const nativeSavingFileIdRef = useRef<string | null>(null);
+  const nativeSavedMetaRef = useRef<{ savedPath?: string; contentUri?: string }>({});
+  const receivedBatchFilesRef = useRef<ReceivedFileRecord[]>([]);
   const currentReceiveFileRef = useRef<{
     index: number;
     file: RemoteFilePreview;
@@ -249,6 +251,8 @@ export function useWifiTransfer() {
     }
     nativeChunkQueueRef.current = [];
     nativeChunkBytesRef.current = 0;
+    nativeSavedMetaRef.current = {};
+    receivedBatchFilesRef.current = [];
     currentBlobChunksRef.current = [];
     currentReceiveFileRef.current = null;
     dirHandleRef.current = null;
@@ -381,21 +385,39 @@ export function useWifiTransfer() {
             nativeChunkQueueRef.current = [];
             nativeChunkBytesRef.current = 0;
             nativeSavingFileIdRef.current = null;
+            nativeSavedMetaRef.current = {};
 
             const safeName = sanitizeFileName(fileMeta.name);
             if (isNativeAndroid()) {
               try {
-                await EzFileSaver.openFile({
+                const opened = await EzFileSaver.openFile({
                   transferId: fileId,
                   fileName: safeName,
                   mimeType: fileMeta.mimeType || 'application/octet-stream',
                 });
                 nativeSavingFileIdRef.current = fileId;
+                nativeSavedMetaRef.current = {
+                  savedPath: opened.savedPath,
+                  contentUri: opened.contentUri,
+                };
                 usingNativeSaver = true;
                 usingDisk = true;
-              } catch {
-                usingNativeSaver = false;
-                nativeSavingFileIdRef.current = null;
+              } catch (err) {
+                const reason =
+                  err instanceof Error && err.message
+                    ? err.message
+                    : 'Izin penyimpanan HP ditolak atau folder Download penuh.';
+                cancelFlagRef.current = true;
+                sendDcJson({ type: 'transfer-cancel', transferId: offer?.transferId });
+                setProgress((prev) => ({
+                  ...prev,
+                  phase: 'error',
+                  errorMessage: `Gagal menyimpan ${safeName}: ${reason}`,
+                  speedBytesPerSec: 0,
+                  etaSeconds: null,
+                }));
+                void closePeerConnection();
+                return;
               }
             }
 
@@ -438,6 +460,10 @@ export function useWifiTransfer() {
             const current = currentReceiveFileRef.current;
             if (!current || current.file.id !== fileId) return;
 
+            let savedPath: string | undefined;
+            let contentUri: string | undefined;
+            let previewUrl: string | undefined;
+
             if (current.usingNativeSaver) {
               if (nativeChunkBytesRef.current > 0) {
                 const merged = new Uint8Array(nativeChunkBytesRef.current);
@@ -453,22 +479,43 @@ export function useWifiTransfer() {
                   base64: uint8ToBase64(merged),
                 });
               }
-              await EzFileSaver.closeFile({ transferId: fileId, abort: false });
+              const closed = await EzFileSaver.closeFile({ transferId: fileId, abort: false });
+              savedPath = closed.savedPath || nativeSavedMetaRef.current.savedPath;
+              contentUri = closed.contentUri || nativeSavedMetaRef.current.contentUri;
               nativeSavingFileIdRef.current = null;
+              nativeSavedMetaRef.current = {};
             } else if (current.usingDisk && currentWritableRef.current) {
               await currentWritableRef.current.close();
               currentWritableRef.current = null;
+              savedPath = sanitizeFileName(current.file.name);
             } else {
               const blob = new Blob(currentBlobChunksRef.current as BlobPart[], {
                 type: current.file.mimeType || 'application/octet-stream',
               });
+              previewUrl = URL.createObjectURL(blob);
               triggerBrowserDownload(blob, sanitizeFileName(current.file.name));
               currentBlobChunksRef.current = [];
             }
 
+            const offer = activeIncomingOfferRef.current;
+            receivedBatchFilesRef.current.push({
+              id: current.file.id,
+              name: current.file.name,
+              size: current.file.size,
+              mimeType: current.file.mimeType,
+              category: current.file.category,
+              savedPath,
+              contentUri,
+              previewUrl,
+              peerName: offer?.fromPeer.name || 'Pengirim',
+              timestamp: Date.now(),
+            });
+
             setIncomingFilesProgress((prev) =>
               prev.map((item) =>
-                item.id === fileId ? { ...item, progress: 100, done: true } : item
+                item.id === fileId
+                  ? { ...item, progress: 100, done: true, savedPath, contentUri, previewUrl }
+                  : item
               )
             );
             currentReceiveFileRef.current = null;
@@ -485,6 +532,9 @@ export function useWifiTransfer() {
             const avgSpeed = offer ? offer.totalBytes / elapsedSec : 0;
 
             if (offer) {
+              const persistedFiles: ReceivedFileRecord[] = receivedBatchFilesRef.current.map(
+                ({ previewUrl: _omit, ...rest }) => rest
+              );
               appendHistory({
                 id: offer.transferId,
                 direction: 'receive',
@@ -495,6 +545,7 @@ export function useWifiTransfer() {
                 avgSpeedBytesPerSec: avgSpeed,
                 status: 'completed',
                 timestamp: Date.now(),
+                files: persistedFiles,
               });
             }
 

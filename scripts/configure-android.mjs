@@ -127,28 +127,47 @@ public class MainActivity extends BridgeActivity {
 `;
 fs.writeFileSync(path.join(javaPkgDir, 'MainActivity.java'), mainActivityJava, 'utf8');
 
-// 5. Write EzFileSaverPlugin.java (direct MediaStore.Downloads streaming)
+// 5. Write EzFileSaverPlugin.java (direct MediaStore.Downloads streaming + in-app / native opener)
 const ezFileSaverJava = `package com.eztransfer.app;
 
+import android.Manifest;
+import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
+import android.content.Intent;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
+import androidx.core.content.FileProvider;
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-@CapacitorPlugin(name = "EzFileSaver")
+@CapacitorPlugin(
+    name = "EzFileSaver",
+    permissions = {
+        @Permission(
+            alias = "storage",
+            strings = {
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            }
+        )
+    }
+)
 public class EzFileSaverPlugin extends Plugin {
 
     private static class SaveSession {
@@ -156,6 +175,7 @@ public class EzFileSaverPlugin extends Plugin {
         Uri mediaUri;
         File legacyFile;
         String fileName;
+        String mimeType;
     }
 
     private final Map<String, SaveSession> sessions = new ConcurrentHashMap<>();
@@ -170,6 +190,48 @@ public class EzFileSaverPlugin extends Plugin {
 
     @PluginMethod
     public void openFile(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && getPermissionState("storage") != PermissionState.GRANTED) {
+            requestPermissionForAlias("storage", call, "storagePermCallback");
+            return;
+        }
+        openFileInternal(call);
+    }
+
+    @PermissionCallback
+    private void storagePermCallback(PluginCall call) {
+        if (getPermissionState("storage") == PermissionState.GRANTED) {
+            openFileInternal(call);
+        } else {
+            call.reject("Izin penyimpanan diperlukan untuk menyimpan file ke folder Download.");
+        }
+    }
+
+    private Uri insertIntoDownloadsMediaStore(ContentResolver resolver, String fileName, String mimeType) {
+        String relPath = Environment.DIRECTORY_DOWNLOADS + "/EzTransfer";
+        String[] candidateMimes = (mimeType != null && !mimeType.trim().isEmpty() && !"application/octet-stream".equals(mimeType))
+            ? new String[] { mimeType.trim(), "application/octet-stream", null }
+            : new String[] { "application/octet-stream", null };
+
+        for (String candidateMime : candidateMimes) {
+            try {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                if (candidateMime != null) {
+                    values.put(MediaStore.Downloads.MIME_TYPE, candidateMime);
+                }
+                values.put(MediaStore.Downloads.RELATIVE_PATH, relPath);
+                values.put(MediaStore.Downloads.IS_PENDING, 1);
+                Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    return uri;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private void openFileInternal(PluginCall call) {
         String transferId = call.getString("transferId");
         String fileName = sanitizeFileName(call.getString("fileName"));
         String mimeType = call.getString("mimeType", "application/octet-stream");
@@ -181,16 +243,13 @@ public class EzFileSaverPlugin extends Plugin {
         try {
             SaveSession session = new SaveSession();
             session.fileName = fileName;
+            session.mimeType = (mimeType != null && !mimeType.trim().isEmpty()) ? mimeType : "application/octet-stream";
+
+            Uri resolvedUri = null;
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentResolver resolver = getContext().getContentResolver();
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
-                values.put(MediaStore.Downloads.MIME_TYPE, mimeType != null && !mimeType.isEmpty() ? mimeType : "application/octet-stream");
-                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/EzTransfer");
-                values.put(MediaStore.Downloads.IS_PENDING, 1);
-
-                Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                Uri uri = insertIntoDownloadsMediaStore(resolver, fileName, session.mimeType);
                 if (uri == null) {
                     call.reject("Gagal membuat file di folder Download/EzTransfer");
                     return;
@@ -203,6 +262,7 @@ public class EzFileSaverPlugin extends Plugin {
                 }
                 session.mediaUri = uri;
                 session.outputStream = os;
+                resolvedUri = uri;
             } else {
                 File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
                 File targetDir = new File(downloadsDir, "EzTransfer");
@@ -222,11 +282,19 @@ public class EzFileSaverPlugin extends Plugin {
                 session.fileName = outFile.getName();
                 session.legacyFile = outFile;
                 session.outputStream = new FileOutputStream(outFile);
+                resolvedUri = FileProvider.getUriForFile(
+                    getContext(),
+                    getContext().getPackageName() + ".fileprovider",
+                    outFile
+                );
             }
 
             sessions.put(transferId, session);
             JSObject result = new JSObject();
             result.put("savedPath", "Download/EzTransfer/" + session.fileName);
+            if (resolvedUri != null) {
+                result.put("contentUri", resolvedUri.toString());
+            }
             call.resolve(result);
         } catch (Exception e) {
             call.reject("Gagal menyiapkan file: " + e.getMessage(), e);
@@ -281,6 +349,8 @@ public class EzFileSaverPlugin extends Plugin {
                 }
             }
 
+            String contentUriStr = null;
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && session.mediaUri != null) {
                 ContentResolver resolver = getContext().getContentResolver();
                 if (abort) {
@@ -289,16 +359,88 @@ public class EzFileSaverPlugin extends Plugin {
                     ContentValues values = new ContentValues();
                     values.put(MediaStore.Downloads.IS_PENDING, 0);
                     resolver.update(session.mediaUri, values, null, null);
+                    contentUriStr = session.mediaUri.toString();
                 }
-            } else if (abort && session.legacyFile != null && session.legacyFile.exists()) {
-                session.legacyFile.delete();
+            } else if (session.legacyFile != null) {
+                if (abort && session.legacyFile.exists()) {
+                    session.legacyFile.delete();
+                } else if (session.legacyFile.exists()) {
+                    MediaScannerConnection.scanFile(
+                        getContext(),
+                        new String[] { session.legacyFile.getAbsolutePath() },
+                        new String[] { session.mimeType },
+                        null
+                    );
+                    contentUriStr = FileProvider.getUriForFile(
+                        getContext(),
+                        getContext().getPackageName() + ".fileprovider",
+                        session.legacyFile
+                    ).toString();
+                }
             }
 
             JSObject result = new JSObject();
             result.put("savedPath", "Download/EzTransfer/" + session.fileName);
+            if (contentUriStr != null) {
+                result.put("contentUri", contentUriStr);
+            }
             call.resolve(result);
         } catch (Exception e) {
             call.reject("Gagal menutup file: " + e.getMessage(), e);
+        }
+    }
+
+    @PluginMethod
+    public void openSavedFile(PluginCall call) {
+        String contentUriStr = call.getString("contentUri", "");
+        String savedPath = call.getString("savedPath", "");
+        String mimeType = call.getString("mimeType", "*/*");
+        if (mimeType == null || mimeType.trim().isEmpty()) {
+            mimeType = "*/*";
+        }
+
+        try {
+            Uri targetUri = null;
+            if (contentUriStr != null && !contentUriStr.trim().isEmpty()) {
+                targetUri = Uri.parse(contentUriStr.trim());
+            } else if (savedPath != null && !savedPath.trim().isEmpty()) {
+                String fileName = savedPath.replace("Download/EzTransfer/", "");
+                File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                File file = new File(new File(downloadsDir, "EzTransfer"), fileName);
+                if (file.exists()) {
+                    targetUri = FileProvider.getUriForFile(
+                        getContext(),
+                        getContext().getPackageName() + ".fileprovider",
+                        file
+                    );
+                }
+            }
+
+            if (targetUri == null) {
+                call.reject("File tidak ditemukan di penyimpanan perangkat.");
+                return;
+            }
+
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(targetUri, mimeType);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+
+            try {
+                Intent chooser = Intent.createChooser(intent, "Buka file dengan");
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(chooser);
+                call.resolve();
+            } catch (ActivityNotFoundException e) {
+                Intent fallback = new Intent(Intent.ACTION_VIEW);
+                fallback.setDataAndType(targetUri, "*/*");
+                fallback.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                Intent chooser = Intent.createChooser(fallback, "Buka file dengan");
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(chooser);
+                call.resolve();
+            }
+        } catch (Exception e) {
+            call.reject("Tidak ada aplikasi di HP yang mendukung format file ini.", e);
         }
     }
 }
@@ -308,7 +450,9 @@ fs.writeFileSync(path.join(javaPkgDir, 'EzFileSaverPlugin.java'), ezFileSaverJav
 // 6. Write EzWifiServerPlugin.java (Embedded Pure-Java HTTP Static Server + WebSocket Signaling)
 const ezWifiServerJava = `package com.eztransfer.app;
 
+import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
+import android.net.Uri;
 import android.util.Base64;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -329,6 +473,7 @@ import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -680,6 +825,18 @@ public class EzWifiServerPlugin extends Plugin {
                 return;
             }
 
+            if ("/native-file".equals(pathOnly)) {
+                if (!socket.getInetAddress().isLoopbackAddress()) {
+                    writeHttpResponse(out, 403, "Forbidden", "text/plain; charset=utf-8", "Forbidden".getBytes(StandardCharsets.UTF_8));
+                    socket.close();
+                    return;
+                }
+                String query = qIdx >= 0 ? fullPath.substring(qIdx + 1) : "";
+                serveNativeContentFile(out, query, headers, "HEAD".equals(method));
+                socket.close();
+                return;
+            }
+
             if (!"GET".equals(method) && !"HEAD".equals(method)) {
                 writeHttpResponse(out, 405, "Method Not Allowed", "text/plain; charset=utf-8", "Method Not Allowed".getBytes(StandardCharsets.UTF_8));
                 socket.close();
@@ -693,6 +850,142 @@ public class EzWifiServerPlugin extends Plugin {
                 socket.close();
             } catch (IOException ignored) {
             }
+        }
+    }
+
+    private void serveNativeContentFile(OutputStream out, String query, Map<String, String> headers, boolean headOnly) throws IOException {
+        String uriParam = null;
+        String mimeParam = null;
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            String k = URLDecoder.decode(pair.substring(0, eq), "UTF-8");
+            String v = URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+            if ("uri".equals(k)) uriParam = v;
+            else if ("mime".equals(k)) mimeParam = v;
+        }
+        if (uriParam == null || uriParam.isEmpty()) {
+            writeHttpResponse(out, 400, "Bad Request", "text/plain; charset=utf-8", "Missing uri".getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+
+        Uri contentUri = Uri.parse(uriParam);
+        String resolvedMime = getContext().getContentResolver().getType(contentUri);
+        if (resolvedMime == null || resolvedMime.isEmpty()) {
+            resolvedMime = (mimeParam != null && !mimeParam.isEmpty()) ? mimeParam : "application/octet-stream";
+        }
+
+        AssetFileDescriptor afd = null;
+        try {
+            afd = getContext().getContentResolver().openAssetFileDescriptor(contentUri, "r");
+        } catch (Exception ignored) {
+        }
+
+        long totalLen = afd != null ? afd.getLength() : -1;
+        InputStream stream = null;
+        try {
+            stream = afd != null ? afd.createInputStream() : getContext().getContentResolver().openInputStream(contentUri);
+            if (stream == null) {
+                writeHttpResponse(out, 404, "Not Found", "text/plain; charset=utf-8", "File not found".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+
+            long start = 0;
+            long end = totalLen > 0 ? totalLen - 1 : -1;
+            boolean isRange = false;
+            String rangeHeader = headers.get("range");
+            if (rangeHeader != null && rangeHeader.startsWith("bytes=") && totalLen > 0) {
+                String spec = rangeHeader.substring(6).split(",")[0].trim();
+                int dash = spec.indexOf('-');
+                if (dash >= 0) {
+                    String sPart = spec.substring(0, dash).trim();
+                    String ePart = spec.substring(dash + 1).trim();
+                    try {
+                        if (!sPart.isEmpty()) {
+                            start = Long.parseLong(sPart);
+                            end = !ePart.isEmpty() ? Math.min(Long.parseLong(ePart), totalLen - 1) : totalLen - 1;
+                            isRange = start >= 0 && start <= end;
+                        } else if (!ePart.isEmpty()) {
+                            long suffix = Long.parseLong(ePart);
+                            start = Math.max(0, totalLen - suffix);
+                            end = totalLen - 1;
+                            isRange = start <= end;
+                        }
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+
+            StringBuilder resp = new StringBuilder();
+            if (isRange && totalLen > 0) {
+                long chunkLen = (end - start) + 1;
+                resp.append("HTTP/1.1 206 Partial Content\\r\\n");
+                resp.append("Content-Type: ").append(resolvedMime).append("\\r\\n");
+                resp.append("Accept-Ranges: bytes\\r\\n");
+                resp.append("Content-Range: bytes ").append(start).append("-").append(end).append("/").append(totalLen).append("\\r\\n");
+                resp.append("Content-Length: ").append(chunkLen).append("\\r\\n");
+                resp.append("Access-Control-Allow-Origin: *\\r\\n");
+                resp.append("Connection: close\\r\\n\\r\\n");
+                out.write(resp.toString().getBytes(StandardCharsets.ISO_8859_1));
+                if (!headOnly) {
+                    skipFully(stream, start);
+                    copyBounded(stream, out, chunkLen);
+                }
+            } else {
+                resp.append("HTTP/1.1 200 OK\\r\\n");
+                resp.append("Content-Type: ").append(resolvedMime).append("\\r\\n");
+                if (totalLen > 0) {
+                    resp.append("Accept-Ranges: bytes\\r\\n");
+                    resp.append("Content-Length: ").append(totalLen).append("\\r\\n");
+                }
+                resp.append("Access-Control-Allow-Origin: *\\r\\n");
+                resp.append("Connection: close\\r\\n\\r\\n");
+                out.write(resp.toString().getBytes(StandardCharsets.ISO_8859_1));
+                if (!headOnly) {
+                    copyBounded(stream, out, totalLen > 0 ? totalLen : Long.MAX_VALUE);
+                }
+            }
+            out.flush();
+        } finally {
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (IOException ignored) {
+                }
+            }
+            if (afd != null) {
+                try {
+                    afd.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private void skipFully(InputStream in, long bytesToSkip) throws IOException {
+        long remaining = bytesToSkip;
+        byte[] skipBuf = new byte[8192];
+        while (remaining > 0) {
+            long skipped = in.skip(remaining);
+            if (skipped > 0) {
+                remaining -= skipped;
+            } else {
+                int r = in.read(skipBuf, 0, (int) Math.min(skipBuf.length, remaining));
+                if (r == -1) break;
+                remaining -= r;
+            }
+        }
+    }
+
+    private void copyBounded(InputStream in, OutputStream out, long maxBytes) throws IOException {
+        byte[] buf = new byte[16384];
+        long remaining = maxBytes;
+        while (remaining > 0) {
+            int toRead = (int) Math.min(buf.length, remaining);
+            int n = in.read(buf, 0, toRead);
+            if (n == -1) break;
+            out.write(buf, 0, n);
+            remaining -= n;
         }
     }
 

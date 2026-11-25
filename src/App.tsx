@@ -5,6 +5,7 @@ import {
   Check,
   Copy,
   Download,
+  Eye,
   FolderUp,
   History,
   Info,
@@ -18,12 +19,13 @@ import {
 import { QRCodeSVG } from 'qrcode.react';
 import { DeviceIcon } from './components/DeviceIcon';
 import { FilePreviewThumb } from './components/FilePreviewThumb';
+import { FileViewerModal } from './components/FileViewerModal';
 import { IncomingOfferModal } from './components/IncomingOfferModal';
 import { TransferMonitor } from './components/TransferMonitor';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useWifiTransfer } from './hooks/useWifiTransfer';
 import { isNativeAndroid } from './native/androidPlugins';
-import type { PeerInfo } from './types/transfer';
+import type { PeerInfo, ReceivedFileRecord } from './types/transfer';
 import { formatBytes, formatDuration, formatSpeed, getDeviceLabel } from './utils/format';
 import { createBatchItem } from './utils/mediaPreview';
 
@@ -76,6 +78,7 @@ export default function App() {
 
   const [isDragging, setIsDragging] = useState(false);
   const [extractingFiles, setExtractingFiles] = useState(false);
+  const [viewingFile, setViewingFile] = useState<ReceivedFileRecord | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -597,6 +600,7 @@ export default function App() {
                 incomingFiles={incomingFilesProgress}
                 onCancel={() => void cancelTransfer()}
                 onDismiss={resetProgress}
+                onOpenFile={(file) => setViewingFile(file)}
               />
 
               {/* File Dropzone & Picker */}
@@ -781,40 +785,73 @@ export default function App() {
                     item.status === 'completed' ? 'text-[#16A34A]' : 'text-[#DC2626]';
 
                   return (
-                    <div
-                      key={item.id}
-                      className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center shrink-0">
-                          {item.direction === 'send' ? (
-                            <ArrowUpRight className="w-4 h-4 text-[#2563EB]" aria-hidden="true" />
-                          ) : (
-                            <ArrowDownLeft className="w-4 h-4 text-[#16A34A]" aria-hidden="true" />
-                          )}
+                    <div key={item.id} className="py-3.5 space-y-2.5">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center shrink-0">
+                            {item.direction === 'send' ? (
+                              <ArrowUpRight className="w-4 h-4 text-[#2563EB]" aria-hidden="true" />
+                            ) : (
+                              <ArrowDownLeft className="w-4 h-4 text-[#16A34A]" aria-hidden="true" />
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-slate-900 truncate">
+                              {item.firstFileName}
+                              {item.fileCount > 1 ? ` (+${item.fileCount - 1} lainnya)` : ''}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {item.direction === 'send' ? 'Dikirim ke' : 'Diterima dari'}{' '}
+                              <span className="font-medium text-slate-700">{item.peerName}</span> ·{' '}
+                              <span className="font-mono tabular-nums">{dateLabel}</span>
+                            </p>
+                          </div>
                         </div>
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-slate-900 truncate">
-                            {item.firstFileName}
-                            {item.fileCount > 1 ? ` (+${item.fileCount - 1} lainnya)` : ''}
-                          </p>
-                          <p className="text-xs text-slate-500">
-                            {item.direction === 'send' ? 'Dikirim ke' : 'Diterima dari'}{' '}
-                            <span className="font-medium text-slate-700">{item.peerName}</span> ·{' '}
-                            <span className="font-mono tabular-nums">{dateLabel}</span>
-                          </p>
+
+                        <div className="flex items-center gap-4 text-xs font-mono tabular-nums pl-12 sm:pl-0 shrink-0">
+                          <span className="text-slate-600">{formatBytes(item.totalBytes)}</span>
+                          {item.status === 'completed' && (
+                            <span className="text-slate-600">{speed.mbPerSec}</span>
+                          )}
+                          <span className={`font-sans font-semibold ${statusColor}`}>
+                            {statusLabel}
+                          </span>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-4 text-xs font-mono tabular-nums pl-12 sm:pl-0 shrink-0">
-                        <span className="text-slate-600">{formatBytes(item.totalBytes)}</span>
-                        {item.status === 'completed' && (
-                          <span className="text-slate-600">{speed.mbPerSec}</span>
+                      {item.direction === 'receive' &&
+                        item.status === 'completed' &&
+                        item.files &&
+                        item.files.length > 0 && (
+                          <div className="pl-12 space-y-1.5">
+                            {item.files.map((f) => (
+                              <div
+                                key={`${item.id}-${f.id}`}
+                                className="flex items-center justify-between gap-2 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2"
+                              >
+                                <div className="min-w-0">
+                                  <p className="text-xs font-medium text-slate-800 truncate">
+                                    {f.name}
+                                  </p>
+                                  <p className="text-[11px] text-slate-500 font-mono truncate">
+                                    {formatBytes(f.size)}
+                                    {f.savedPath ? ` · ${f.savedPath}` : ''}
+                                  </p>
+                                </div>
+                                {(f.contentUri || f.savedPath || f.previewUrl) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingFile(f)}
+                                    className="inline-flex items-center gap-1 min-h-[34px] px-3 py-1 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" aria-hidden="true" />
+                                    <span>Buka</span>
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         )}
-                        <span className={`font-sans font-semibold ${statusColor}`}>
-                          {statusLabel}
-                        </span>
-                      </div>
                     </div>
                   );
                 })}
@@ -999,6 +1036,13 @@ cd ~/eztransfer && git add . && git commit -m "Build APK" && git push`}
           onReject={() => void rejectIncomingOffer()}
         />
       )}
+
+      {/* In-App File Viewer Modal */}
+      <FileViewerModal
+        file={viewingFile}
+        nativeServerInfo={nativeServerInfo}
+        onClose={() => setViewingFile(null)}
+      />
 
       {/* Offline Status Banner */}
       {!isOnline && (

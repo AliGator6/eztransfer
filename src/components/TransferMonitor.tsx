@@ -1,14 +1,20 @@
 import React from 'react';
-import { AlertCircle, CheckCircle2, HardDrive, XCircle } from 'lucide-react';
-import type { BatchFileItem, RemoteFilePreview, TransferProgressState } from '../types/transfer';
+import { AlertCircle, CheckCircle2, Eye, HardDrive, XCircle } from 'lucide-react';
+import type {
+  BatchFileItem,
+  IncomingFileProgress,
+  ReceivedFileRecord,
+  TransferProgressState,
+} from '../types/transfer';
 import { formatBytes, formatEta, formatSpeed } from '../utils/format';
 
 interface TransferMonitorProps {
   progress: TransferProgressState;
   outgoingQueue: BatchFileItem[];
-  incomingFiles: Array<RemoteFilePreview & { bytesReceived: number; progress: number; done: boolean }>;
+  incomingFiles: IncomingFileProgress[];
   onCancel: () => void;
   onDismiss: () => void;
+  onOpenFile?: (file: ReceivedFileRecord) => void;
 }
 
 export const TransferMonitor: React.FC<TransferMonitorProps> = ({
@@ -17,6 +23,7 @@ export const TransferMonitor: React.FC<TransferMonitorProps> = ({
   incomingFiles,
   onCancel,
   onDismiss,
+  onOpenFile,
 }) => {
   if (progress.phase === 'idle') return null;
 
@@ -70,17 +77,18 @@ export const TransferMonitor: React.FC<TransferMonitorProps> = ({
           <p className="text-xs text-slate-500 mt-1 font-mono tabular-nums">
             {formatBytes(progress.transferredBytes)} / {formatBytes(progress.totalBytes)} ·{' '}
             {progress.totalFiles} file
-            {progress.direction === 'receive' && progress.phase === 'transferring' && (
-              <>
-                {' · '}
-                <span className="inline-flex items-center gap-1 text-slate-700 font-sans">
-                  <HardDrive className="w-3.5 h-3.5 inline" aria-hidden="true" />
-                  {progress.usingDirectDiskWrite
-                    ? 'Menulis langsung ke disk'
-                    : 'Unduhan browser standar'}
-                </span>
-              </>
-            )}
+            {progress.direction === 'receive' &&
+              (progress.phase === 'transferring' || progress.phase === 'completed') && (
+                <>
+                  {' · '}
+                  <span className="inline-flex items-center gap-1 text-slate-700 font-sans">
+                    <HardDrive className="w-3.5 h-3.5 inline" aria-hidden="true" />
+                    {progress.usingDirectDiskWrite
+                      ? 'Tersimpan ke Download/EzTransfer'
+                      : 'Unduhan standar'}
+                  </span>
+                </>
+              )}
           </p>
         </div>
 
@@ -160,17 +168,48 @@ export const TransferMonitor: React.FC<TransferMonitorProps> = ({
         </div>
       )}
 
-      {/* Per-file receive progress list */}
+      {/* Per-file receive progress list with direct Open button */}
       {progress.direction === 'receive' && incomingFiles.length > 0 && (
-        <div className="divide-y divide-slate-100 border-t border-slate-100 pt-2 max-h-52 overflow-y-auto">
+        <div className="divide-y divide-slate-100 border-t border-slate-100 pt-2 max-h-64 overflow-y-auto">
           {incomingFiles.map((file) => (
             <div key={file.id} className="py-2 flex items-center justify-between gap-3 text-sm">
-              <span className="truncate text-slate-700 font-medium">{file.name}</span>
-              <div className="flex items-center gap-3 shrink-0 font-mono tabular-nums text-xs text-slate-600">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-slate-800 font-medium">{file.name}</div>
+                {file.done && file.savedPath && (
+                  <div className="text-[11px] text-slate-500 font-mono truncate">
+                    {file.savedPath}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2.5 shrink-0 font-mono tabular-nums text-xs text-slate-600">
                 <span>{formatBytes(file.size)}</span>
                 <span className={file.done ? 'text-[#16A34A] font-semibold' : 'text-[#2563EB]'}>
                   {file.done ? '100%' : `${file.progress}%`}
                 </span>
+                {file.done && onOpenFile && (file.contentUri || file.savedPath || file.previewUrl) && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onOpenFile({
+                        id: file.id,
+                        name: file.name,
+                        size: file.size,
+                        mimeType: file.mimeType,
+                        category: file.category,
+                        savedPath: file.savedPath,
+                        contentUri: file.contentUri,
+                        previewUrl: file.previewUrl,
+                        peerName: progress.remotePeer?.name || 'Pengirim',
+                        timestamp: Date.now(),
+                      })
+                    }
+                    className="inline-flex items-center gap-1 min-h-[32px] px-2.5 py-1 font-sans text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-md transition-colors cursor-pointer"
+                  >
+                    <Eye className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Buka</span>
+                  </button>
+                )}
               </div>
             </div>
           ))}

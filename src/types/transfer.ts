@@ -45,6 +45,28 @@ export interface RemoteFilePreview {
   height?: number;
 }
 
+export interface IncomingFileProgress extends RemoteFilePreview {
+  bytesReceived: number;
+  progress: number;
+  done: boolean;
+  savedPath?: string;
+  contentUri?: string;
+  previewUrl?: string;
+}
+
+export interface ReceivedFileRecord {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  category: RemoteFilePreview['category'];
+  savedPath?: string;
+  contentUri?: string;
+  previewUrl?: string;
+  peerName: string;
+  timestamp: number;
+}
+
 export interface IncomingOffer {
   transferId: string;
   fromPeer: PeerInfo;
@@ -86,4 +108,5 @@ export interface TransferHistoryItem {
   avgSpeedBytesPerSec: number;
   status: 'completed' | 'cancelled' | 'rejected' | 'error';
   timestamp: number;
+  files?: ReceivedFileRecord[];
 }

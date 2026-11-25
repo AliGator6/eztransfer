@@ -20,7 +20,7 @@ export interface EzFileSaverPluginInterface {
     transferId: string;
     fileName: string;
     mimeType: string;
-  }): Promise<{ savedPath: string }>;
+  }): Promise<{ savedPath: string; contentUri?: string }>;
   appendChunk(options: {
     transferId: string;
     base64: string;
@@ -28,7 +28,12 @@ export interface EzFileSaverPluginInterface {
   closeFile(options: {
     transferId: string;
     abort?: boolean;
-  }): Promise<{ savedPath?: string }>;
+  }): Promise<{ savedPath?: string; contentUri?: string }>;
+  openSavedFile(options: {
+    contentUri?: string;
+    savedPath?: string;
+    mimeType?: string;
+  }): Promise<void>;
 }
 
 export const EzWifiServer = registerPlugin<EzWifiServerPluginInterface>('EzWifiServer');
